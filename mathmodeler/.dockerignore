@@ -1,0 +1,16 @@
+# Docker build context is the monorepo root (mathmodeler/).
+# Exclude build artifacts so the agent image asset doesn't recursively copy
+# the CDK output (which causes ENAMETOOLONG) or bloat the context.
+infra/cdk.out
+infra/node_modules
+infra
+tests
+samples
+portal/frontend/node_modules
+portal/frontend/out
+portal/frontend/dist
+
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.git

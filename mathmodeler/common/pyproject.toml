@@ -1,0 +1,25 @@
+[project]
+name = "mm-common"
+version = "0.1.0"
+description = "MathModeler shared library (config, llm/Strands, HMML, S3 bus, memory, dag, FastAPI server, tools)"
+requires-python = ">=3.10"
+dependencies = [
+    "boto3>=1.34",
+    "numpy>=1.26",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.6",
+    # strands-agents (import name: strands) is required at runtime in agent containers;
+    # kept optional here so common-lib unit tests can run without it via monkeypatch.
+]
+
+[project.optional-dependencies]
+strands = ["strands-agents>=0.1.0"]
+test = ["pytest>=8", "pytest-cov>=5", "moto>=5", "httpx>=0.27"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["mm_common*"]

@@ -1,0 +1,88 @@
+"""mm_common.llm — Strands Agent factory (tech-design §2.2, route ② core).
+
+Each agent = Strands ``Agent(model=BedrockModel(claude-opus-4), system_prompt,
+tools)``. This module provides ``build_agent()`` (tool-using agent factory) plus
+a no-tools ``LLM.generate()`` convenience wrapper (preserving the original
+signature) for pure-text scenarios such as HMML LLM scoring.
+
+The ``strands`` imports are deferred so that AWS-free unit tests can monkeypatch
+``make_model`` / ``build_agent`` without installing ``strands-agents`` or
+touching Bedrock.
+"""
+from __future__ import annotations
+
+from . import config
+
+
+def make_model(temperature: float = 0.0, max_tokens: int = 8192):
+    """Construct a Strands ``BedrockModel`` for the configured Claude model.
+
+    Newer Claude Opus models (e.g. opus-4-8) reject the ``temperature`` inference
+    parameter ("`temperature` is deprecated for this model"), so it is omitted
+    here; ``temperature`` is kept in the signature for backward compatibility but
+    intentionally not forwarded.
+    """
+    from strands.models import BedrockModel
+
+    return BedrockModel(
+        model_id=config.MODEL_ID,
+        region_name=config.REGION,
+        max_tokens=max_tokens,
+    )
+
+
+
+def build_agent(system_prompt: str, tools: list, temperature: float = 0.0,
+                max_tokens: int = 8192, *, streaming: bool = True):
+    """Construct a tool-using Strands Agent (agents-as-tools).
+
+    ``tools`` is a list of ``@tool``-decorated functions.
+
+    ``streaming=True`` (the default) sets ``callback_handler=None`` so the agent is
+    driven via ``agent.stream_async()`` (the Supervisor path) without the default
+    stdout PrintingCallbackHandler interfering. Set ``streaming=False`` to keep the
+    legacy synchronous ``agent(task)`` behaviour with the default callback handler.
+    """
+    from strands import Agent
+
+    kwargs: dict = {
+        "model": make_model(temperature, max_tokens),
+        "system_prompt": system_prompt,
+        "tools": tools,
+    }
+    if streaming:
+        kwargs["callback_handler"] = None
+    return Agent(**kwargs)
+
+
+
+class LLM:
+    """No-tools convenience wrapper preserving the original ``generate()`` API."""
+
+    def __init__(self, temperature: float = 0.0, max_tokens: int = 8192):
+        self.model = make_model(temperature, max_tokens)
+        self._usage = {"input_tokens": 0, "output_tokens": 0}
+
+    def generate(self, prompt: str, system: str | None = None) -> str:
+        from strands import Agent
+
+        agent = Agent(model=self.model, system_prompt=system or "")
+        result = agent(prompt)
+        self._accumulate_usage(result)
+        return str(result)
+
+    def _accumulate_usage(self, result) -> None:
+        # Strands AgentResult exposes usage metrics; be tolerant of shape.
+        try:
+            usage = getattr(getattr(result, "metrics", None), "accumulated_usage", None)
+            if usage:
+                self._usage["input_tokens"] += int(usage.get("inputTokens", 0))
+                self._usage["output_tokens"] += int(usage.get("outputTokens", 0))
+        except Exception:
+            pass
+
+    def get_total_usage(self) -> dict:
+        return dict(self._usage)
+
+    def clear_usage(self) -> None:
+        self._usage = {"input_tokens": 0, "output_tokens": 0}

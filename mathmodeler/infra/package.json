@@ -1,0 +1,22 @@
+{
+  "name": "mathmodeler-infra",
+  "version": "0.1.0",
+  "bin": { "mathmodeler": "bin/mathmodeler.js" },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "synth": "cdk synth",
+    "deploy": "cdk deploy --require-approval never",
+    "destroy": "cdk destroy --force"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "aws-cdk": "^2.225.0",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.225.0",
+    "@aws-cdk/aws-bedrock-agentcore-alpha": "~2.225.0-alpha.0",
+    "constructs": "^10.3.0"
+  }
+}
