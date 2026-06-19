@@ -144,7 +144,18 @@ export function Chat({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages]);
 
-  // Persist to localStorage history when the conversation grows (and idle).
+  // Periodic save during streaming: every 15s while busy, persist the latest
+  // snapshot so DDB stays roughly in sync even if user closes the tab.
+  useEffect(() => {
+    if (!busy || messages.length === 0) return;
+    const timer = setInterval(() => {
+      saveSession(id, messages as any[]);
+    }, 15_000);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [busy, messages, id]);
+
+  // Persist to DDB when the conversation finishes streaming (idle).
   useEffect(() => {
     if (busy || messages.length === 0) return;
     saveSession(id, messages as any[]);
