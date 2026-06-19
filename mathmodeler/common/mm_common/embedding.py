@@ -38,15 +38,29 @@ def _get_client():
 
 
 def _embed(text: str) -> np.ndarray:
-    """Return the Nova MME embedding vector for a single text string."""
-    body = {"text": text}  # TEXT modality only; schema pinned in §10.3 contract test
+    """Return the Nova MME embedding vector for a single text string.
+
+    Nova 2 Multimodal Embeddings (``amazon.nova-2-multimodal-embeddings-v1:0``)
+    requires the ``SINGLE_EMBEDDING`` task schema (a bare ``{"text": ...}`` body
+    is rejected with ``required key [messages] not found``). The vector is
+    returned under ``embeddings[0].embedding``.
+    """
+    body = {
+        "taskType": "SINGLE_EMBEDDING",
+        "singleEmbeddingParams": {
+            "embeddingPurpose": "GENERIC_INDEX",
+            "embeddingDimension": config.EMBED_DIM,
+            "text": {"truncationMode": "END", "value": text},
+        },
+    }
     resp = _get_client().invoke_model(
         modelId=config.EMBED_MODEL_ID,
         body=json.dumps(body).encode(),
     )
     payload = json.loads(resp["body"].read())
-    vec = payload["embedding"]  # field name pinned in §10.3 contract test
+    vec = payload["embeddings"][0]["embedding"]
     return np.asarray(vec, dtype=np.float32)
+
 
 
 def _normalize(v: np.ndarray) -> np.ndarray:

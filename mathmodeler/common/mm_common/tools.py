@@ -1,6 +1,6 @@
 """mm_common.tools — per-agent @tool factories (tech-design §2.10, route ② core).
 
-Each agent is a Strands ``Agent(system_prompt, tools)``. The reusable ``@tool``s
+Each agent is a   ``Agent(system_prompt, tools)``. The reusable ``@tool``s
 are defined here as factory functions that close over ``session_id`` /
 ``task_id`` and are then handed to ``build_agent``. The original deterministic
 flow (actor-critic / debug-retry / four-stage ordering) lives in each agent's
@@ -14,6 +14,8 @@ asserted.
 """
 from __future__ import annotations
 
+import subprocess
+
 try:  # pragma: no cover - exercised indirectly
     from strands import tool
 except Exception:  # strands-agents not installed (unit-test environment)
@@ -25,7 +27,7 @@ except Exception:  # strands-agents not installed (unit-test environment)
             return _wrap
         return func
 
-from . import config, dag, events, invoke, memory, s3_io
+from . import config, dag, events, invoke, memory, workspace, s3_io
 
 
 
@@ -34,42 +36,68 @@ from . import config, dag, events, invoke, memory, s3_io
 # ---------------------------------------------------------------------------
 def analyst_tools(session_id: str) -> list:
     @tool
-    def describe_data(s3_key: str) -> str:
-        """Read and summarise an uploaded data file (returns a plain-text summary)."""
-        try:
-            # s3_key is an absolute key under the bucket; read raw text best-effort
-            rel = s3_key.split(f"{session_id}/", 1)[-1]
-            text = s3_io.get_text(session_id, rel)
-            return text[:4000]
-        except Exception as e:  # noqa: BLE001
-            return f"{{\"ok\": false, \"error\": \"{e}\"}}"
+    def describe_data(description: str) -> str:
+        """List and summarise data files in the session workspace data/ folder.
 
-    @tool
-    def save_analysis(markdown: str) -> str:
-        """Save the finalised problem analysis to analysis/problem_analysis.md; return S3 key."""
-        return s3_io.put_text(session_id, "analysis/problem_analysis.md", markdown)
+        Args:
+            description: ≤10字中文动作摘要（展示给用户）。
 
-    @tool
-    def save_task_descriptions(tasks: list) -> str:
-        """Save subtask decomposition [{id,title,description}] to analysis/task_descriptions.json."""
-        return s3_io.put_json(session_id, "analysis/task_descriptions.json", tasks)
-
-    @tool
-    def build_dag(graph: dict, tasknum: int) -> dict:
-        """Build a DAG from adjacency list {tid:[deps]}; Kahn topo-sort -> order.
-
-        Falls back to linear dependencies on parse/cycle error. Returns
-        {"dag":..., "order":[...]}.
+        MUST be called at the start of analysis to check if any data files exist.
+        Returns file listing with summaries, or 'No data files found' if empty.
         """
+        try:
+            data_dir = workspace.file_path(session_id, "data")
+            if not data_dir.exists():
+                return "No data files found in workspace."
+            files = list(data_dir.iterdir())
+            if not files:
+                return "No data files found in workspace."
+            summaries = []
+            for f in sorted(files):
+                if f.is_file():
+                    size = f.stat().st_size
+                    # Read first 2000 chars for text files
+                    preview = ""
+                    try:
+                        text = f.read_text(encoding="utf-8")[:2000]
+                        preview = f"\n  Preview: {text[:500]}..."
+                    except Exception:
+                        preview = " (binary file)"
+                    summaries.append(f"  - {f.name} ({size} bytes){preview}")
+            if not summaries:
+                return "No data files found in workspace."
+            return "Data files in workspace:\n" + "\n".join(summaries)
+        except Exception as e:  # noqa: BLE001
+            return f'{{"ok": false, "error": "{e}"}}'
+
+    @tool
+    def build_dag(description: str, tasks: list, graph: dict) -> dict:
+        """Build a subtask DAG from task definitions and dependency graph.
+
+        Args:
+            description: ≤10字中文动作摘要（展示给用户）。
+            tasks: List of [{id, title, description}] defining each subtask.
+            graph: Adjacency list {tid: [dep_ids]} defining dependencies.
+
+        Saves both task_descriptions.json and dag.json to the workspace.
+        Returns {"dag": ..., "order": [...], "tasknum": N}.
+        """
+        # Save task descriptions
+        workspace.write_json(session_id, "analysis/task_descriptions.json", tasks)
+
+        # Compute topological order; fallback to linear on error
+        tasknum = len(tasks)
         try:
             order = dag.compute_dag_order(graph)
         except Exception:
             graph = dag.fallback_linear_dag(tasknum)
             order = dag.compute_dag_order(graph)
-        s3_io.put_json(session_id, "analysis/dag.json", graph)
-        return {"dag": graph, "order": order}
 
-    return [describe_data, save_analysis, save_task_descriptions, build_dag]
+        # Save DAG
+        workspace.write_json(session_id, "analysis/dag.json", graph)
+        return {"dag": graph, "order": order, "tasknum": tasknum}
+
+    return [describe_data, build_dag]
 
 
 # ---------------------------------------------------------------------------
@@ -83,20 +111,22 @@ def modeler_tools(session_id: str, retriever) -> list:
         try:
             return retriever.retrieve_methods(description, top_k=top_k, method="embedding")
         except Exception as e:  # noqa: BLE001
-            return f"{{\"ok\": false, \"error\": \"{e}\"}}"
+            return f'{{"ok": false, "error": "{e}"}}'
 
     @tool
-    def get_analysis() -> str:
-        """Read the problem analysis at analysis/problem_analysis.md."""
-        return s3_io.get_text(session_id, "analysis/problem_analysis.md")
-
-    @tool
-    def critique_modeling(task_description: str, task_analysis: str,
+    def critique_modeling(description: str, task_description: str, task_analysis: str,
                           modeling_formulas: str) -> str:
         """Self-evaluation tool: ask an independent Mathematical Modeling Critic
         to critique the CURRENT modeling formulas (accuracy/rigor, innovation,
         applicability). Returns a plain-text critique highlighting weaknesses
-        only — use it to drive an actor->critic refinement loop before saving."""
+        only — use it to drive an actor->critic refinement loop before saving.
+
+        Args:
+            description: ≤10字中文动作摘要（展示给用户）。
+            task_description: The subtask description.
+            task_analysis: The task analysis text.
+            modeling_formulas: The current modeling formulas to critique.
+        """
         from .llm import LLM
         from .prompts import FORMULAS_CRITIC_SYSTEM
 
@@ -112,57 +142,229 @@ def modeler_tools(session_id: str, retriever) -> list:
         except Exception as e:  # noqa: BLE001
             return f"(critic unavailable: {e})"
 
-    @tool
-    def save_modeling(task_id: str, payload: dict) -> str:
-        """Save a subtask's modeling result to modeling/<task_id>.json.
-
-        ``payload`` may include ``critic_rounds`` (a list of {round, critique})
-        recording the actor->critic refinement trace."""
-        return s3_io.put_json(session_id, f"modeling/{task_id}.json", payload)
-
-    return [retrieve_hmml_methods, get_analysis, critique_modeling, save_modeling]
+    return [retrieve_hmml_methods, critique_modeling]
 
 
 
 # ---------------------------------------------------------------------------
 # Solver
 # ---------------------------------------------------------------------------
+# Maximum stdout chars returned to the LLM (~5K tokens). Prevents base64 or
+# other massive print() output from blowing up context. The limit is enforced
+# ONLY on the tool result seen by the model; internal tools (export_sandbox_file)
+# bypass this because they call ci.execute() directly.
+_MAX_STDOUT_CHARS = 20_000
+
 def solver_tools(session_id: str, ci) -> list:
     @tool
-    def execute_code(code: str) -> dict:
+    async def execute_code(description: str, code: str):
         """Execute Python in the AgentCore Code Interpreter sandbox.
 
+        Args:
+            description: <=10 char Chinese action summary (shown to user).
+            code: The Python code to execute.
+
         Returns {ok, stdout, stderr, artifacts}.
+        Streams stdout in real-time by tailing a log file in the sandbox.
+
+        IMPORTANT:
+        - Execution time is LIMITED to ~5 minutes. If your script takes longer,
+          it will be terminated with a TIMEOUT error.
+        - NEVER print binary/base64 content to stdout. Use plt.savefig() to create
+          figures, then call export_sandbox_file to transfer them to workspace.
+        - DO print progress messages (e.g. print("Step 1/3 done...", flush=True))
+          so the user can see computation progress in real time.
+        """
+        import asyncio
+        import threading
+        import time as _time
+        timeout = config.CI_EXECUTE_TIMEOUT_SECONDS
+
+        # Wrap user code: tee stdout to _run.log so we can tail it.
+        # NOTE: All paths use relative (CWD) names because the AgentCore CI SDK
+        # rejects absolute /tmp/ paths in write_files (path traversal filter).
+        wrapper_code = "import sys, io\nclass _Tee(io.TextIOBase):\n    def __init__(self, orig, log):\n        self._orig = orig\n        self._log = log\n    def write(self, s):\n        self._orig.write(s)\n        self._log.write(s)\n        self._log.flush()\n        return len(s)\n    def flush(self):\n        self._orig.flush()\n        self._log.flush()\n_log_f = open('_run.log', 'w')\nsys.stdout = _Tee(sys.stdout, _log_f)\ntry:\n    exec(open('_user_code.py').read())\nfinally:\n    sys.stdout = sys.stdout._orig\n    _log_f.close()\n    open('_run_done', 'w').write('1')\n"
+
+        # Upload user code to sandbox (relative path — /tmp/ is blocked by SDK)
+        try:
+            ci.write_files([{"path": "_user_code.py", "text": code}])
+        except Exception as e:  # noqa: BLE001
+            yield {"ok": False, "stdout": "", "stderr": f"Failed to upload code: {e}", "artifacts": []}
+            return
+
+        # Start execution in a background thread
+        exec_result = {}
+
+        def _run():
+            try:
+                exec_result["value"] = ci.execute(wrapper_code)
+            except Exception as e:  # noqa: BLE001
+                exec_result["error"] = str(e)
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+
+        # Poll _run.log every 2 seconds
+        offset = 0
+        deadline = _time.time() + timeout
+        poll_interval = 2.0
+
+        while thread.is_alive() and _time.time() < deadline:
+            await asyncio.sleep(poll_interval)
+            try:
+                tail_result = ci.invoke(
+                    "executeCommand",
+                    {"command": f"tail -c +{offset + 1} _run.log 2>/dev/null"}
+                )
+                new_text = ""
+                stream = tail_result.get("stream") if isinstance(tail_result, dict) else None
+                if stream:
+                    for ev in stream:
+                        res = ev.get("result", ev) if isinstance(ev, dict) else {}
+                        for blk in res.get("content", []) or []:
+                            if isinstance(blk, dict) and blk.get("type") == "text":
+                                new_text += blk.get("text", "")
+                if new_text:
+                    offset += len(new_text.encode("utf-8"))
+                    yield {"stdout_chunk": new_text}
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Check timeout
+        if thread.is_alive():
+            yield {"stdout_chunk": "[TIMEOUT] execution timed out"}
+            yield {
+                "ok": False,
+                "stdout": "",
+                "stderr": (
+                    f"EXECUTION_TIMEOUT: Script exceeded {timeout}s limit. "
+                    "Your code is too slow. Optimize or simplify, then retry."
+                ),
+                "artifacts": [],
+            }
+            return
+
+        # Thread finished; get result
+        thread.join(timeout=5)
+
+        if "error" in exec_result:
+            yield {"ok": False, "stdout": "", "stderr": exec_result["error"], "artifacts": []}
+            return
+
+        result = exec_result.get("value", {"ok": False, "stdout": "", "stderr": "No result", "artifacts": []})
+
+        # Truncate large stdout: keep head + tail, omit middle (never error)
+        stdout = result.get("stdout", "") or ""
+        if len(stdout) > _MAX_STDOUT_CHARS:
+            head = stdout[:3000]
+            tail = stdout[-3000:]
+            omitted = len(stdout) - 6000
+            result["stdout"] = head + "\n... [" + str(omitted) + " chars omitted] ...\n" + tail
+
+        yield result
+
+    @tool
+    def write_sandbox_file(description: str, path: str, content: str) -> dict:
+        """Write a file (e.g. a full Python script) into the sandbox filesystem.
+
+        Args:
+            description: ≤10字中文动作摘要（展示给用户）。
+            path: File path in the sandbox.
+            content: File content.
+
+        Prefer writing your COMPLETE self-contained script with this tool (e.g.
+        path="solution.py"), then run it via
+        execute_code("exec(open('solution.py').read())"). This keeps each
+        execute_code payload small and avoids long, fragmented interactions.
+        Returns {ok, stderr}.
         """
         try:
-            return ci.execute(code)
+            return ci.write_files([{"path": path, "text": content}])
         except Exception as e:  # noqa: BLE001
-            return {"ok": False, "stdout": "", "stderr": str(e), "artifacts": []}
+            return {"ok": False, "stderr": str(e)}
 
     @tool
-    def get_modeling(task_id: str) -> dict:
-        """Read the modeling result for a subtask from modeling/<task_id>.json."""
-        return s3_io.get_json(session_id, f"modeling/{task_id}.json")
+    def read_sandbox_file(description: str, path: str) -> dict:
+        """Read a file back from the sandbox filesystem.
 
-    @tool
-    def read_dependent_artifacts(task_id: str) -> str:
-        """Read prerequisite subtasks' artifact paths/results (dependent_file_prompt)."""
+        Args:
+            description: ≤10字中文动作摘要（展示给用户）。
+            path: File path in the sandbox.
+
+        Returns {ok, stdout, stderr}.
+        """
         try:
-            return s3_io.get_text(session_id, f"solving/{task_id}.deps.txt")
-        except Exception:
-            return ""
+            return ci.read_files([path])
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "stdout": "", "stderr": str(e)}
 
     @tool
-    def save_code(task_id: str, code: str) -> str:
-        """Save the generated code to solving/<task_id>.py."""
-        return s3_io.put_text(session_id, f"solving/{task_id}.py", code, content_type="text/x-python")
+    def export_sandbox_file(description: str, sandbox_path: str, workspace_path: str) -> dict:
+        """Export a file (including binary like PNG/PDF) from the sandbox to the workspace.
 
-    @tool
-    def save_result(task_id: str, result: dict) -> str:
-        """Save the solving result to solving/<task_id>.json."""
-        return s3_io.put_json(session_id, f"solving/{task_id}.json", result)
+        Use this to save plots/figures generated in the sandbox (e.g. by matplotlib
+        plt.savefig) directly to the workspace WITHOUT base64 encoding. This is the
+        preferred way to export images and other binary artifacts.
 
-    return [execute_code, get_modeling, read_dependent_artifacts, save_code, save_result]
+        Args:
+            description: ≤10字中文动作摘要（展示给用户）。
+            sandbox_path: Path of the file inside the sandbox (e.g. "plot.png").
+            workspace_path: Destination path in the workspace (e.g. "solving/figures/T1_trajectory.png").
+        """
+        import base64 as _b64
+        try:
+            # Use executeCode to base64-encode the file inside the sandbox and
+            # capture it via stdout. This bypasses the readFiles API which returns
+            # empty for binary files (SDK limitation confirmed by test).
+            # The base64 content stays internal to this tool — never exposed to LLM.
+            _export_code = (
+                f"import base64, os, sys\n"
+                f"path = {sandbox_path!r}\n"
+                f"if not os.path.exists(path):\n"
+                f"    print('__FILE_NOT_FOUND__', file=sys.stderr)\n"
+                f"else:\n"
+                f"    with open(path, 'rb') as f:\n"
+                f"        print(base64.b64encode(f.read()).decode())\n"
+            )
+            result = ci.execute(_export_code)
+            stderr = result.get("stderr", "")
+            if "__FILE_NOT_FOUND__" in stderr:
+                return {"ok": False, "error": f"File not found in sandbox: {sandbox_path}"}
+            raw = (result.get("stdout", "") or "").strip()
+            if not raw:
+                return {"ok": False, "error": f"Empty content from sandbox: {sandbox_path}"}
+            # Guard: reject files > 5MB (base64 is ~1.33x original size)
+            if len(raw) > 7_000_000:  # ~5MB binary
+                size_kb = len(raw) // 1333
+                return {
+                    "ok": False,
+                    "error": (
+                        f"File too large to export in one piece ({size_kb}KB, max ~5MB). "
+                        "Split the file in the sandbox first using execute_code, e.g.:\n"
+                        "  import os; data=open('big.pdf','rb').read()\n"
+                        "  chunk=4*1024*1024  # 4MB chunks\n"
+                        "  for i in range(0,len(data),chunk):\n"
+                        "      open(f'part_{i//chunk}.bin','wb').write(data[i:i+chunk])\n"
+                        "Then export each part_N.bin separately with export_sandbox_file "
+                        "and reassemble on the workspace side, or reduce the file size "
+                        "(e.g. lower DPI for plots)."
+                    ),
+                }
+            from . import workspace as _ws
+            from .runners import _current_session_id
+            sid = _current_session_id
+            if not sid:
+                return {"ok": False, "error": "No active session context"}
+            out_path = _ws.session_path(sid) / workspace_path
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            data = _b64.b64decode(raw)
+            out_path.write_bytes(data)
+            return {"ok": True, "path": workspace_path, "size": len(data)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    return [execute_code, write_sandbox_file, read_sandbox_file, export_sandbox_file]
+
 
 
 # ---------------------------------------------------------------------------
@@ -170,37 +372,100 @@ def solver_tools(session_id: str, ci) -> list:
 # ---------------------------------------------------------------------------
 def reporter_tools(session_id: str) -> list:
     @tool
-    def get_analysis() -> str:
-        """Read the problem analysis at analysis/problem_analysis.md."""
-        return s3_io.get_text(session_id, "analysis/problem_analysis.md")
+    def list_artifacts(description: str, task_id: str) -> list:
+        """List chart/figure files generated by the solver for a subtask.
 
-    @tool
-    def get_modeling(task_id: str) -> dict:
-        """Read the modeling result for a subtask."""
-        return s3_io.get_json(session_id, f"modeling/{task_id}.json")
-
-    @tool
-    def get_solving(task_id: str) -> dict:
-        """Read the solving result for a subtask."""
-        return s3_io.get_json(session_id, f"solving/{task_id}.json")
-
-    @tool
-    def list_artifacts(task_id: str) -> list:
-        """Read the list of chart/artifact references for a subtask (best-effort)."""
-        try:
-            res = s3_io.get_json(session_id, f"solving/{task_id}.json")
-            return res.get("artifacts", [])
-        except Exception:
+        Args:
+            description: ≤10字中文动作摘要（展示给用户）。
+            task_id: The subtask ID whose artifacts to list.
+        """
+        figures_dir = workspace.file_path(session_id, "solving/figures")
+        if not figures_dir.exists():
             return []
+        # Return files that match the task_id prefix
+        results = []
+        for f in sorted(figures_dir.iterdir()):
+            if f.is_file() and (task_id in f.name or f.name.startswith(task_id)):
+                results.append({
+                    "name": f.name,
+                    "path": f"solving/figures/{f.name}",
+                    "size": f.stat().st_size,
+                })
+        # If no task-specific files, return all figures
+        if not results:
+            for f in sorted(figures_dir.iterdir()):
+                if f.is_file():
+                    results.append({
+                        "name": f.name,
+                        "path": f"solving/figures/{f.name}",
+                        "size": f.stat().st_size,
+                    })
+        return results
 
     @tool
-    def save_report(markdown: str) -> dict:
-        """Save the final report to report/report.md; return {report_key, report_url}."""
-        key = s3_io.put_text(session_id, "report/report.md", markdown)
-        url = s3_io.presign(session_id, "report/report.md")
-        return {"report_key": key, "report_url": url}
+    def compile_report(description: str) -> dict:
+        """Compile report.tex to PDF using xelatex.
 
-    return [get_analysis, get_modeling, get_solving, list_artifacts, save_report]
+        Args:
+            description: ≤10字中文动作摘要（展示给用户）。
+
+        Runs xelatex twice (for cross-references). If successful, uploads the
+        PDF to S3 and returns {ok, pdf_path, s3_url}. If compilation fails,
+        returns {ok: false, stderr: ...}.
+        """
+        report_dir = workspace.file_path(session_id, "report")
+        tex_file = report_dir / "report.tex"
+
+        if not tex_file.exists():
+            return {"ok": False, "stderr": "report.tex not found. Write report/report.tex first."}
+
+        # Copy solver figures to report/figures/ for LaTeX \includegraphics
+        solver_figs = workspace.file_path(session_id, "solving/figures")
+        report_figs = report_dir / "figures"
+        report_figs.mkdir(parents=True, exist_ok=True)
+        if solver_figs.exists():
+            import shutil
+            for fig in solver_figs.iterdir():
+                if fig.is_file():
+                    shutil.copy2(fig, report_figs / fig.name)
+
+        # Run xelatex twice
+        stderr_output = ""
+        for _pass in range(2):
+            result = subprocess.run(
+                ["xelatex", "-interaction=nonstopmode", "-halt-on-error", "report.tex"],
+                cwd=str(report_dir),
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode != 0:
+                stderr_output = result.stdout[-3000:] if result.stdout else result.stderr[-3000:]
+                # Don't fail on first pass (cross-ref warnings are expected)
+                if _pass == 1:
+                    return {"ok": False, "stderr": f"xelatex failed (pass {_pass+1}):\n{stderr_output}"}
+
+        pdf_path = report_dir / "report.pdf"
+        if not pdf_path.exists():
+            return {"ok": False, "stderr": "PDF not generated after xelatex runs."}
+
+        # Upload final PDF to S3
+        s3_url = ""
+        try:
+            pdf_bytes = pdf_path.read_bytes()
+            s3_url = s3_io.put_bytes(session_id, "report/report.pdf", pdf_bytes, "application/pdf")
+        except Exception as e:  # noqa: BLE001
+            s3_url = f"(S3 upload failed: {e})"
+
+        return {
+            "ok": True,
+            "pdf_path": str(pdf_path),
+            "s3_url": s3_url,
+            "size_bytes": pdf_path.stat().st_size,
+        }
+
+    return [list_artifacts, compile_report]
+
 
 
 # ---------------------------------------------------------------------------
@@ -298,13 +563,15 @@ def orchestrator_tools(session_id: str, actor_id: str) -> list:
         )
 
     @tool
-    def invoke_reporter(problem: str, order: list) -> dict:
+    def invoke_reporter(problem: str, order: list, language: str = "中文") -> dict:
         """Invoke the Reporter sub-agent to assemble the FINAL report once all
-        subtasks in ``order`` have been modelled and solved. Returns
-        {ok, report_key, report_url}."""
+        subtasks in ``order`` have been modelled and solved. ``language`` is
+        the user-confirmed language for the report (中文/English/mixed).
+        Returns {ok, pdf_path, s3_url}."""
         return _dispatch(
             "reporter", config.REPORTER_ARN,
-            {"session_id": session_id, "problem": problem, "order": order},
+            {"session_id": session_id, "problem": problem, "order": order,
+             "language": language},
             session_id,
         )
 
@@ -313,7 +580,7 @@ def orchestrator_tools(session_id: str, actor_id: str) -> list:
         """Read the Analyst's subtask decomposition [{id,title,description}] so
         you can pass each subtask's description to invoke_modeler."""
         try:
-            return s3_io.get_json(session_id, "analysis/task_descriptions.json") or []
+            return workspace.read_json(session_id, "analysis/task_descriptions.json") or []
         except Exception:  # noqa: BLE001
             return []
 

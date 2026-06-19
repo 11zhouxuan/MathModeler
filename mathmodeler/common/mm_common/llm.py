@@ -14,7 +14,7 @@ from __future__ import annotations
 from . import config
 
 
-def make_model(temperature: float = 0.0, max_tokens: int = 8192):
+def make_model(temperature: float = 0.0, max_tokens: int = 16384):
     """Construct a Strands ``BedrockModel`` for the configured Claude model.
 
     Newer Claude Opus models (e.g. opus-4-8) reject the ``temperature`` inference
@@ -22,18 +22,28 @@ def make_model(temperature: float = 0.0, max_tokens: int = 8192):
     here; ``temperature`` is kept in the signature for backward compatibility but
     intentionally not forwarded.
     """
+    from botocore.config import Config as BotoConfig
     from strands.models import BedrockModel
+
+    # Increase read timeout to avoid ReadTimeoutError on long tool executions
+    # (e.g. save_analysis writing large analysis markdown). Default is 60s.
+    boto_config = BotoConfig(
+        read_timeout=300,
+        connect_timeout=10,
+        retries={"max_attempts": 2, "mode": "adaptive"},
+    )
 
     return BedrockModel(
         model_id=config.MODEL_ID,
         region_name=config.REGION,
         max_tokens=max_tokens,
+        boto_client_config=boto_config,
     )
 
 
 
 def build_agent(system_prompt: str, tools: list, temperature: float = 0.0,
-                max_tokens: int = 8192, *, streaming: bool = True):
+                max_tokens: int = 16384, *, streaming: bool = True):
     """Construct a tool-using Strands Agent (agents-as-tools).
 
     ``tools`` is a list of ``@tool``-decorated functions.

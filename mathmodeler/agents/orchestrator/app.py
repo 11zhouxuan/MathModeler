@@ -26,11 +26,43 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
-from mm_common import config, events, memory, s3_io
+from mm_common import config, events, memory, s3_io, workspace
+
+# Emit INFO-level logs to stdout so the orchestrator's tool calls / sub-agent
+# activity are visible in the container/uvicorn logs (otherwise only uvicorn's
+# access lines "POST /invocations 200 OK" show up).
+#
+# uvicorn installs its own logging handlers on the root logger, which makes a
+# bare ``logging.basicConfig`` a no-op. To guarantee our ``mm.*`` loggers always
+# emit at INFO regardless of how the app is launched, attach a dedicated stdout
+# StreamHandler to the ``mm`` parent logger and force its level.
+def _configure_mm_logging() -> None:
+    import sys
+
+    mm_root = logging.getLogger("mm")
+    mm_root.setLevel(logging.INFO)
+    if not any(getattr(h, "_mm_handler", False) for h in mm_root.handlers):
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        handler._mm_handler = True  # type: ignore[attr-defined]
+        mm_root.addHandler(handler)
+    # Don't double-emit through the (uvicorn-configured) root logger.
+    mm_root.propagate = False
+
+
+_configure_mm_logging()
+logger = logging.getLogger("mm.orchestrator")
+
+
 from mm_common.llm import build_agent
 from mm_common.prompts import SUPERVISOR_SYSTEM
 from mm_common.runners import (
+    set_session_context,
+    BUILTIN_TOOLS,
     build_analyst_agent,
     build_modeler_agent,
     build_reporter_agent,
@@ -72,6 +104,34 @@ def _make_state_store():
 # served by the same Runtime instance (S3 makes it durable across instances too).
 _STATE_STORE = None
 
+# Track running Supervisors by session_id so /cancel can call agent.cancel().
+_RUNNING: dict[str, Supervisor] = {}
+
+
+def cancel_session(session_id: str) -> bool:
+    """Cancel a running session's agents using Strands Agent.cancel().
+
+    cancel() is thread-safe and sets _cancel_signal — the agent stops at the
+    next checkpoint (during model streaming or before tool execution) and
+    returns with stop_reason="cancelled".
+    """
+    sup = _RUNNING.get(session_id)
+    if not sup:
+        logger.warning("[orchestrator] CANCEL session=%s — NOT FOUND in _RUNNING", session_id)
+        return False
+    logger.info("[orchestrator] CANCEL session=%s", session_id)
+    try:
+        sup.supervisor.cancel()
+    except Exception:  # noqa: BLE001
+        pass
+    for name, a in sup.subagents.items():
+        try:
+            a.cancel()
+        except Exception:  # noqa: BLE001
+            pass
+    return True
+
+
 
 def _state_store():
     global _STATE_STORE
@@ -82,7 +142,7 @@ def _state_store():
 
 def build_supervisor(session_id: str) -> Supervisor:
     """Construct the MathModeler Supervisor with the four in-process sub-agents."""
-    supervisor_agent = build_agent(SUPERVISOR_SYSTEM, tools=[])
+    supervisor_agent = build_agent(SUPERVISOR_SYSTEM, tools=list(BUILTIN_TOOLS))
     subagents = {
         "analyst": build_analyst_agent(session_id),
         "modeler": build_modeler_agent(session_id),
@@ -98,38 +158,57 @@ def build_supervisor(session_id: str) -> Supervisor:
 
 
 def _build_task(body: dict) -> str:
+    """Build the user message for the supervisor.
+
+    Only the user's raw problem (inside <user_problem> delimiters) plus the
+    session_id. All workflow/coordination instructions live in the system prompt
+    (SUPERVISOR_SYSTEM). Keeping this message minimal and in the user's own
+    language ensures the LLM naturally responds in that language.
+    """
     session_id = body["session_id"]
     problem = body["problem"]
     return (
-        f"session_id={session_id}\n"
-        "请对以下数学建模问题完成完整的四阶段流程（分析→建模→求解→报告）：\n"
-        "先 run_subagent(\"analyst\", ...) 得到子任务拓扑顺序 order 与各子任务描述，"
-        "再按 order 对每个子任务依次 run_subagent(\"modeler\", ...) 然后 "
-        "run_subagent(\"solver\", ...)，全部完成后 run_subagent(\"reporter\", ...) "
-        "生成最终报告。\n\n"
-        f"问题：\n{problem}"
+        f"session_id={session_id}\n\n"
+        f"<user_problem>\n{problem}\n</user_problem>"
     )
+
 
 
 async def stream_supervisor(body: dict):
     """Async SSE generator (AI SDK v6 frames) driving the streaming Supervisor."""
     session_id = body["session_id"]
+    problem = body.get("problem", "")
+    logger.info(
+        "[orchestrator] /invocations session=%s problem_len=%d keys=%s",
+        session_id, len(problem or ""), sorted(body.keys()),
+    )
+    # Initialize session workspace (creates directory structure)
+    workspace.init_session(session_id)
+    set_session_context(session_id)
+
     sup = build_supervisor(session_id)
+    _RUNNING[session_id] = sup
     tx = StrandsToAISDK()
 
     interrupt_responses = body.get("interruptResponses")
     if interrupt_responses:
+        logger.info("[orchestrator] RESUME session=%s with %d interruptResponses",
+                    session_id, len(interrupt_responses))
         sup.restore(_state_store().load(session_id))
         gen = sup.stream(resume=interrupt_responses)
     else:
-        gen = sup.stream(task=_build_task(body))
+        task = _build_task(body)
+        logger.info("[orchestrator] START session=%s (task %d chars)", session_id, len(task))
+        gen = sup.stream(task=task)
 
     try:
         async for frame in tx.run(gen):
             yield frame
     finally:
+        _RUNNING.pop(session_id, None)
         # Best-effort: stop any Solver Code Interpreter session opened for this run.
         _teardown_subagents(sup)
+
 
 
 def _teardown_subagents(sup: Supervisor) -> None:
@@ -256,3 +335,18 @@ def _stream_pipeline_sync(body: dict):
 
 
 app = make_app(handler=run_pipeline, stream_handler=stream_pipeline)
+
+
+# --- cancel (agent-level stop) ---------------------------------------------
+from fastapi import Request as _CancelRequest
+from fastapi.responses import JSONResponse as _CancelResponse
+
+
+@app.post("/cancel")
+async def _cancel_route(request: _CancelRequest) -> _CancelResponse:
+    """Cancel a running session by calling Agent.cancel() on all active agents."""
+    body = await request.json()
+    session_id = (body or {}).get("session_id", "")
+    found = cancel_session(session_id) if session_id else False
+    return _CancelResponse({"cancelled": found, "session_id": session_id})
+

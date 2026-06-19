@@ -1,9 +1,10 @@
 # Portal for ALB + Fargate (tech-design §8.2, plan C). Build context = repo root
 # (mathmodeler/) so we can COPY common and build the frontend SPA.
-# Multi-stage: (1) Node builds the Vite/React/AI-SDK SPA -> static bundle;
+# Multi-stage: (1) Node builds the Next.js static export -> out/;
 #              (2) ARM64 python runtime serves it + the FastAPI streaming API.
 
-# --- stage 1: build the frontend (AI SDK v6 + React + Vite) ---------------
+# --- stage 1: build the frontend (Next.js + AI SDK v6 + shadcn/ui) --------
+
 FROM --platform=linux/arm64 node:20-slim AS frontend
 WORKDIR /fe
 COPY portal/frontend/package.json portal/frontend/package-lock.json* ./

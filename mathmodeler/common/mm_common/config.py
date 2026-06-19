@@ -48,7 +48,10 @@ HMML_PARENT_WEIGHT: float
 HMML_CHILD_WEIGHT: float
 ACTOR_CRITIC_ROUNDS: int
 SOLVER_MAX_RETRIES: int
+CI_SESSION_TIMEOUT_SECONDS: int
+CI_HEARTBEAT_SECONDS: int
 INPROCESS: bool
+
 ORCHESTRATION: str
 
 
@@ -79,6 +82,15 @@ def reload() -> None:
     g["HMML_CHILD_WEIGHT"] = _float("HMML_CHILD_WEIGHT", 0.5)
     g["ACTOR_CRITIC_ROUNDS"] = _int("ACTOR_CRITIC_ROUNDS", 1)
     g["SOLVER_MAX_RETRIES"] = _int("SOLVER_MAX_RETRIES", 3)
+    # Code Interpreter session lifetime + idle keep-alive heartbeat.
+    # AgentCore CI allows up to 8h (28800s) max session lifetime, but reclaims a
+    # session idle >~15min; a periodic lightweight keep-alive keeps it warm.
+    g["CI_SESSION_TIMEOUT_SECONDS"] = _int("CI_SESSION_TIMEOUT_SECONDS", 28800)
+    g["CI_HEARTBEAT_SECONDS"] = _int("CI_HEARTBEAT_SECONDS", 300)
+    # Max time a single execute_code call may run before being declared timed-out.
+    # Prevents long-running scripts from blocking the SSE stream indefinitely.
+    g["CI_EXECUTE_TIMEOUT_SECONDS"] = _int("CI_EXECUTE_TIMEOUT_SECONDS", 300)
+
 
     # Single-Runtime agents-as-tools mode (§5/§8): when true, the Orchestrator's
     # invoke_* tools call the sub-agents IN-PROCESS (mm_common.runners) instead

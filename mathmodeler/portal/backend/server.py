@@ -28,6 +28,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import mimetypes
 import os
 import secrets
@@ -35,8 +36,12 @@ import time
 import uuid
 from pathlib import Path
 
+logger = logging.getLogger("mm.portal")
+
+
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -87,6 +92,16 @@ _TOKENS: set[str] = set()
 
 app = FastAPI(title="MathModeler Portal", docs_url=None, redoc_url=None)
 
+# CORS: allow the frontend dev server (port 3000) to call the portal directly,
+# bypassing the Next.js proxy (which doesn't stream SSE properly in Turbopack).
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # dev convenience; in prod, frontend is same-origin
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["x-vercel-ai-ui-message-stream"],
+)
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -249,6 +264,26 @@ def _iter_chat_stream(body: dict):
     actor_id = body.get("actor_id", "anonymous")
     interrupt_responses = _extract_interrupt_responses(body)
 
+    # Diagnostic: surface how the incoming chat body is shaped so an empty
+    # ``problem`` (the "problem appears empty" symptom) can be traced to the
+    # frontend message format vs. the portal's extraction.
+    try:
+        last_user = next(
+            (m for m in reversed(messages) if (m or {}).get("role") == "user"), {}
+        )
+        part_types = [
+            p.get("type") for p in (last_user.get("parts") or [])
+            if isinstance(p, dict)
+        ]
+        logger.info(
+            "[portal] /api/chat body_keys=%s n_messages=%d last_user_part_types=%s "
+            "extracted_problem_len=%d session=%s",
+            sorted(body.keys()), len(messages), part_types, len(problem or ""), sid,
+        )
+    except Exception:  # noqa: BLE001 - logging must never break the stream
+        pass
+
+
     # Let the frontend capture the session id for any later resume turn.
     yield _sdk_frame({"type": "data-session", "id": sid, "data": {"session_id": sid}})
 
@@ -320,10 +355,104 @@ async def chat(request: Request, _: None = Depends(_require_auth)) -> StreamingR
     )
 
 
+# --- cancel (forward to orchestrator agent.stop) ----------------------------
+@app.post("/api/cancel")
+async def cancel(request: Request, _: None = Depends(_require_auth)) -> JSONResponse:
+    body = await request.json()
+    session_id = (body or {}).get("session_id", "")
+    # Forward to the orchestrator's /cancel endpoint (local: port 8080).
+    import urllib.request
+    orch_url = os.environ.get("ORCHESTRATOR_URL", "http://127.0.0.1:8080")
+    try:
+        req = urllib.request.Request(
+            f"{orch_url}/cancel",
+            data=json.dumps({"session_id": session_id}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:  # noqa: S310
+            result = json.loads(r.read())
+    except Exception:  # noqa: BLE001
+        result = {"cancelled": False, "session_id": session_id, "error": "unreachable"}
+    return JSONResponse(result)
+
+
+# --- chat history persistence (DynamoDB, cross-browser) --------------------
+
+@app.get("/api/sessions")
+async def list_sessions(_: None = Depends(_require_auth)) -> JSONResponse:
+    """List all chat sessions (most recent first) from DynamoDB."""
+    from mm_common import chat_store
+    sessions = chat_store.list_sessions()
+    return JSONResponse({"sessions": sessions})
+
+
+@app.get("/api/sessions/{session_id}/messages")
+async def get_session_messages(session_id: str, _: None = Depends(_require_auth)) -> JSONResponse:
+    """Return the saved UI messages for a session from DynamoDB."""
+    from mm_common import chat_store
+    messages = chat_store.load_messages(session_id)
+    return JSONResponse({"messages": messages})
+
+
+@app.post("/api/sessions/{session_id}/messages")
+async def save_session_messages(session_id: str, request: Request, _: None = Depends(_require_auth)) -> JSONResponse:
+    """Save UI messages to DynamoDB (called by frontend when stream completes)."""
+    from mm_common import chat_store
+    body = await request.json()
+    messages = body.get("messages", [])
+    problem = body.get("problem", "")
+    try:
+        chat_store.save_session(session_id, messages, problem=problem)
+        return JSONResponse({"ok": True})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+# --- workspace file browser API (session files) ----------------------------
+# These routes expose the session workspace files for the frontend file browser
+# panel. In local dev, workspace is ./jobs/{session_id}/; in Runtime it's
+# /mnt/workspace/jobs/{session_id}/.
+
+@app.get("/api/files/{session_id}")
+async def list_session_files(session_id: str, _: None = Depends(_require_auth)) -> JSONResponse:
+    """List all files in a session workspace as a tree structure."""
+    from mm_common import workspace
+    tree = workspace.list_tree(session_id)
+    return JSONResponse({"session_id": session_id, "tree": tree})
+
+
+@app.get("/api/files/{session_id}/{file_path:path}")
+async def download_session_file(session_id: str, file_path: str, _: None = Depends(_require_auth)):
+    """Download a specific file from the session workspace."""
+    from mm_common import workspace
+
+    full_path = workspace.file_path(session_id, file_path)
+    # Security: ensure the resolved path is within the session workspace
+    session_root = workspace.session_path(session_id)
+    try:
+        full_path.resolve().relative_to(session_root.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="path traversal denied")
+
+    if not full_path.exists() or not full_path.is_file():
+        raise HTTPException(status_code=404, detail=f"file not found: {file_path}")
+
+    # Determine content type
+    ctype = mimetypes.guess_type(str(full_path))[0] or "application/octet-stream"
+    return FileResponse(
+        str(full_path),
+        media_type=ctype,
+        filename=full_path.name,
+        headers={"Content-Disposition": f'attachment; filename="{full_path.name}"'},
+    )
+
+
 # --- static frontend -------------------------------------------------------
 @app.get("/")
 def index() -> FileResponse:
     return _serve_static("index.html")
+
 
 
 

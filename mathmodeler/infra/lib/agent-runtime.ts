@@ -99,6 +99,8 @@ export class AgentRuntime extends Construct {
         DOC_BUCKET: props.bucket.bucketName,
 
         MEMORY_ID: props.memory.memoryId,
+        // Workspace root for session artifacts (Managed filesystem in Runtime).
+        MM_WORKSPACE_ROOT: "/mnt/workspace/jobs",
         ...(props.extraEnv ?? {}),
       },
     });

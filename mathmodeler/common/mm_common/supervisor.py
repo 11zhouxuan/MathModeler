@@ -27,7 +27,47 @@ re-do S3 side effects), ``run_subagent`` consults ``self._completed`` — a
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
+
 from typing import Any, Awaitable, Callable
+
+logger = logging.getLogger("mm.supervisor")
+
+
+def _completion_key(name: str, subtask: Any) -> str:
+    """Re-entrancy cache key scoped to (sub-agent name, subtask).
+
+    The cache exists to avoid RE-RUNNING an interrupted ``run_subagent`` call
+    from the top on HITL resume (Strands re-invokes the tool). It must be keyed
+    by BOTH the sub-agent name AND its subtask: the supervisor legitimately
+    calls the SAME sub-agent (e.g. ``modeler``) many times with DIFFERENT
+    subtasks (T1, T2, …). Keying by name alone made every later call short-
+    circuit to the first task's cached result (cross-task contamination).
+    """
+    h = hashlib.sha1(str(subtask or "").encode("utf-8")).hexdigest()[:16]
+    return f"{name}\x1f{h}"
+
+
+
+def _short(value: Any) -> str:
+
+
+    """Render a tool input/output as a one-line string for logs (NO truncation)."""
+    try:
+        if isinstance(value, (dict, list)):
+            text = json.dumps(value, ensure_ascii=False)
+        elif isinstance(value, str):
+            text = value
+        else:
+            text = str(value)
+    except Exception:  # noqa: BLE001
+        text = repr(value)
+    return " ".join(text.split())  # collapse newlines/whitespace for one-line logs
+
+
+
 
 try:  # pragma: no cover - exercised indirectly; tests inject fakes
     from strands import tool
@@ -82,26 +122,97 @@ class Supervisor:
 
     # ------------------------------------------------------------------ tools
     def _inject_tools(self) -> None:
-        """Add run_subagent + ask_user to the supervisor and ask_user to each sub-agent."""
+        """Add run_subagent + ask_user + update_task + thinking to the supervisor;
+        ask_user + thinking to each sub-agent."""
         run_subagent = self._make_run_subagent()
         ask_user = self._make_ask_user()
-        _append_tools(self.supervisor, [run_subagent, ask_user])
+        update_task = self._make_update_task()
+        thinking = self._make_thinking()
+        _append_tools(self.supervisor, [run_subagent, ask_user, update_task, thinking])
         for sub in self.subagents.values():
-            _append_tools(sub, [self._make_ask_user()])
+            _append_tools(sub, [self._make_ask_user(), self._make_thinking()])
 
     def _make_ask_user(self):
         @tool(context=True)
-        def ask_user(tool_context, question: str) -> str:
-            """Ask the end user a clarifying question and wait for their answer."""
+        def ask_user(tool_context, question: str, type: str = "text") -> str:
+            """Ask the end user a question and wait for their answer.
+
+            Args:
+                question: The question to ask the user.
+                type: Interaction type. One of:
+                    - "text": User types a free-form text answer (default).
+                    - "confirm": User clicks a Confirm or Modify button.
+                    - "choice": User selects from options listed in the question.
+            """
+            logger.info("[supervisor] ask_user -> %r (type=%s)", question, type)
             return tool_context.interrupt(
-                "supervisor-ask", reason={"agent": "supervisor", "question": question}
+                "supervisor-ask",
+                reason={"agent": "supervisor", "question": question, "inputType": type},
             )
 
+
         return ask_user
+
+    def _make_update_task(self):
+        """Create the update_task tool for the supervisor to report task progress.
+
+        The supervisor calls this tool with the full task list (each item has
+        id, title, status, deps) whenever the plan changes or a task transitions.
+        The tool result is echoed back to the model; the streaming transformer
+        (StrandsToAISDK) intercepts it and emits a ``data-task`` SSE frame so the
+        front-end can render the DAG panel in real time.
+        """
+        @tool
+        def update_task(tasks: list) -> str:
+            """Update the task progress panel with the current state of all tasks.
+
+            Args:
+                tasks: A list of task objects. Each object has:
+                    - id (str): Task identifier (e.g. "问题分析", "T1", "T2")
+                    - title (str): Human-readable task title
+                    - status (str): One of "idle", "active", "done"
+                    - deps (list[str]): List of task IDs this task depends on
+
+            Call this tool:
+            1. At the very start with only the analysis task (status="active").
+            2. After analysis completes, with the full task list from the DAG.
+            3. Before each subsequent run_subagent call to mark the next task active.
+            """
+            logger.info("[supervisor] update_task: %d tasks — %s", len(tasks or []), json.dumps(tasks, ensure_ascii=False)[:2000])
+            # Return the tasks in the result so the SSE transformer can also
+            # emit data-task from the toolResult (more reliable than partial input).
+            return json.dumps({"ok": True, "n_tasks": len(tasks or []), "tasks": tasks})
+
+        return update_task
+
+    def _make_thinking(self):
+        @tool
+        def thinking(thought: str) -> str:
+            """Use this tool to think and reason about the current situation.
+
+            Call this tool FIRST when you receive a new task to analyze the
+            problem, determine the output language, and plan your approach.
+            You can also call it anytime you need to reason through a
+            difficult decision.
+
+            Args:
+                thought: Your internal reasoning. Include:
+                    - What language the user is using (and therefore what
+                      language you must output in)
+                    - Your understanding of the current task
+                    - Your plan for next steps
+                    - Any concerns or decisions to make
+            """
+            logger.info("[supervisor] thinking: %s", thought[:200])
+            return "OK"
+
+        return thinking
 
     def _make_run_subagent(self):
         subagents = self.subagents
         completed = self._completed
+        supervisor = self.supervisor
+
 
         async def _drive(sub, name, prompt):
             """Run a sub-agent's stream_async, yielding wrapped child events.
@@ -111,37 +222,129 @@ class Supervisor:
             Returns the final AgentResult via the ``.result`` attribute trick.
             """
             result = None
-            async for ev in sub.stream_async(prompt):
-                if "data" in ev and ev["data"]:
-                    yield {"node": name, "data": ev["data"]}
-                elif ev.get("current_tool_use") and ev["current_tool_use"].get("name"):
-                    yield {"node": name, "current_tool_use": ev["current_tool_use"]}
-                if "result" in ev:
-                    result = ev["result"]
+            _seen_tools: set[str] = set()
+            _logged_input: set[str] = set()
+            _tool_name_by_id: dict[str, str] = {}
+            try:
+                async for ev in sub.stream_async(prompt):
+                    if "data" in ev and ev["data"]:
+                        yield {"node": name, "data": ev["data"]}
+                    elif ev.get("current_tool_use") and ev["current_tool_use"].get("name"):
+                        tu = ev["current_tool_use"]
+                        tname = tu.get("name")
+                        tid = tu.get("toolUseId") or tname
+                        _tool_name_by_id[tid] = tname
+                        # Log each distinct tool call the sub-agent makes (once per id).
+                        if tid not in _seen_tools:
+                            _seen_tools.add(tid)
+                            logger.info("[supervisor] subagent %r -> tool %s", name, tname)
+                        # Log the tool INPUT once the streamed args parse as valid JSON
+                        # (the input arrives incrementally as a partial JSON string).
+                        if tid not in _logged_input:
+                            raw_in = tu.get("input")
+                            parsed = raw_in
+                            if isinstance(raw_in, str):
+                                try:
+                                    parsed = json.loads(raw_in)
+                                except Exception:  # noqa: BLE001 - still partial
+                                    parsed = None
+                            if parsed is not None and parsed != "":
+                                _logged_input.add(tid)
+                                logger.info(
+                                    "[supervisor] subagent %r tool %s INPUT: %s",
+                                    name, tname, _short(parsed),
+                                )
+                        yield {"node": name, "current_tool_use": tu}
+                    # Tool RESULT bubbles back as a user-role message carrying toolResult.
+                    msg = ev.get("message")
+                    if isinstance(msg, dict) and msg.get("role") == "user":
+                        has_tool_result = False
+                        for blk in msg.get("content", []) or []:
+                            tr = blk.get("toolResult") if isinstance(blk, dict) else None
+                            if not tr:
+                                continue
+                            has_tool_result = True
+                            rid = tr.get("toolUseId")
+                            rname = _tool_name_by_id.get(rid, "tool")
+                            texts = [b.get("text") for b in tr.get("content", []) or []
+                                     if isinstance(b, dict) and b.get("text")]
+                            out = "\n".join(t for t in texts if t) or tr.get("status", "")
+                            logger.info(
+                                "[supervisor] subagent %r tool %s OUTPUT: %s",
+                                name, rname, _short(out),
+                            )
+                        # Forward the tool-result message so the SSE transformer can
+                        # close the matching tool card (state -> output-available).
+                        if has_tool_result:
+                            yield {"node": name, "message": msg}
+                    # Nested ToolStreamEvent from sub-agent tools (e.g. execute_code
+                    # streaming stdout). Surface as text so frontend shows live output.
+                    tse = ev.get("tool_stream_event")
+                    if isinstance(tse, dict):
+                        tse_data = tse.get("data")
+                        if isinstance(tse_data, dict) and "stdout_chunk" in tse_data:
+                            chunk = tse_data["stdout_chunk"]
+                            if chunk:
+                                yield {"node": name, "data": chunk}
+                    if "result" in ev:
+
+                        result = ev["result"]
+
+            except Exception:  # noqa: BLE001 - surface the real failure in the logs
+                logger.exception("[supervisor] subagent %r stream_async CRASHED", name)
+                raise
             _drive.last_result = result  # type: ignore[attr-defined]
 
+
         @tool(context=True)
-        async def run_subagent(tool_context, name: str, subtask: str):
+        async def run_subagent(tool_context, description: str, name: str, subtask: str):
             """Delegate ``subtask`` to the named sub-agent and return its result.
+
+            Args:
+                description: ≤10字中文动作摘要（展示给用户，如"分析问题结构"）。
+                name: Sub-agent name (analyst/modeler/solver/reporter).
+                subtask: The task instruction to pass to the sub-agent.
 
             The sub-agent runs to completion (its progress streams live); if it calls
             ``ask_user`` the whole chain pauses for user input and resumes later.
             """
-            # Re-entrancy: a finished sub-agent returns its cached result (no re-run).
-            if name in completed:
-                yield {"node": name, "result_text": completed[name]}
-                yield {"status": "success", "content": [{"text": completed[name]}]}
+            logger.info(
+                "[supervisor] run_subagent(name=%r) subtask=%s",
+                name, _short(subtask or ""),
+            )
+
+            # Re-entrancy: a finished sub-agent call returns its cached result so an
+            # interrupted call (re-run from the top by Strands on HITL resume) does
+            # not re-hit the model / redo S3 side effects. Keyed by (name, subtask)
+            # so the SAME sub-agent invoked for DIFFERENT subtasks (T1, T2, …) is
+            # NOT short-circuited to an earlier task's result.
+            ckey = _completion_key(name, subtask)
+            if ckey in completed:
+                logger.info("[supervisor] run_subagent(%r): cache hit (skip re-run) subtask=%s",
+                            name, _short(subtask or ""))
+                yield {"node": name, "result_text": completed[ckey]}
+                yield {"status": "success", "content": [{"text": completed[ckey]}]}
                 return
+
 
             sub = subagents.get(name)
             if sub is None:
                 msg = f"unknown subagent: {name}"
+                logger.warning("[supervisor] %s", msg)
                 yield {"status": "error", "content": [{"text": msg}]}
                 return
 
             # Four-stage progress marker (start) — surfaced as data-stage downstream.
+            logger.info("[supervisor] subagent %r START", name)
             yield {"node": name, "stage_status": "start"}
+
+            # LANGUAGE: handled purely via prompts. SUPERVISOR_SYSTEM instructs the
+            # supervisor to write subtask instructions in the user's language, and
+            # LANGUAGE_PREAMBLE + LANGUAGE_DIRECTIVE (prepended/appended to every
+            # agent's system prompt) enforce that each agent outputs in the same
+            # language as the user's problem. No code-side detection/rewrite here.
             gen = _drive(sub, name, subtask)
+
             async for ev in gen:
                 yield ev
             r = getattr(_drive, "last_result", None)
@@ -165,10 +368,19 @@ class Supervisor:
                 r = getattr(_drive, "last_result", None)
 
             text = _extract_text(r)
-            completed[name] = text
+            completed[ckey] = text
+            logger.info("[supervisor] subagent %r DONE (result %d chars)", name, len(text))
+
             yield {"node": name, "result_text": text}
             # async-gen tool: the LAST yield is the tool result (decorator.py:618-623).
-            yield {"status": "success", "content": [{"text": text}]}
+            # Include a system-reminder to prompt supervisor to call update_task.
+            reminder = (
+                "\n\n<system-reminder>"
+                "请在适当时机调用 update_task 工具更新任务进度面板。"
+                "</system-reminder>"
+            )
+            yield {"status": "success", "content": [{"text": text + reminder}]}
+
 
         return run_subagent
 
@@ -200,7 +412,8 @@ class Supervisor:
             self._persist()
             yield {"mm": {"type": "ask", "interruptId": sup_int.id,
                           "question": reason.get("question", ""),
-                          "agent": reason.get("agent", "supervisor")}}
+                          "agent": reason.get("agent", "supervisor"),
+                          "inputType": reason.get("inputType", "text")}}
             return
 
         # Completed: persist final state (idempotent) and emit a final marker.

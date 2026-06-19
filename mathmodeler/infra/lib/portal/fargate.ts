@@ -6,6 +6,7 @@ import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as agentcore from '@aws-cdk/aws-bedrock-agentcore-alpha';
 import { Platform } from 'aws-cdk-lib/aws-ecr-assets';
 
@@ -18,6 +19,8 @@ export interface PortalFargateProps {
   bucket: s3.IBucket;
   /** AgentCore Memory (best-effort event logging). */
   memory: agentcore.Memory;
+  /** DynamoDB table for chat history persistence. */
+  chatHistoryTable: dynamodb.ITable;
   /** P1 admin credentials (deploy-time, via CDK context). */
   adminUser: string;
   adminPassword: string;
@@ -73,6 +76,7 @@ export class PortalFargate extends Construct {
         AWS_REGION_NAME: 'us-west-2',
         DOC_BUCKET: props.bucket.bucketName,
         MEMORY_ID: props.memory.memoryId,
+        CHAT_HISTORY_TABLE: props.chatHistoryTable.tableName,
         PORTAL_ADMIN_USER: props.adminUser,
         PORTAL_ADMIN_PASSWORD: props.adminPassword,
       },
@@ -91,6 +95,8 @@ export class PortalFargate extends Construct {
 
     // S3 document bus read/write (report retrieval / presign).
     props.bucket.grantReadWrite(taskRole);
+    // DynamoDB chat history (read/write for session persistence).
+    props.chatHistoryTable.grantReadWriteData(taskRole);
     // AgentCore Memory (best-effort event logging).
     taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
       actions: [

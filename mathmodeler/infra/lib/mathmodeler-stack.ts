@@ -1,6 +1,7 @@
 import { Construct } from 'constructs';
 import { Stack, StackProps, RemovalPolicy, Duration, CfnOutput } from 'aws-cdk-lib';
 import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as agentcore from '@aws-cdk/aws-bedrock-agentcore-alpha';
 
 import { AgentRuntime } from './agent-runtime';
@@ -54,6 +55,15 @@ export class MathModelerStack extends Stack {
     });
 
 
+    // --- DynamoDB: Chat History (cross-browser session persistence) ---
+    const chatHistoryTable = new dynamodb.Table(this, 'ChatHistory', {
+      tableName: 'MathModeler-ChatHistory',
+      partitionKey: { name: 'PK', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'SK', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+
     // --- Portal: ALB + Fargate (FastAPI, real-time SSE; tech-design §7.5/§8.2) ---
     // P1 admin credentials are supplied at deploy time via CDK context:
     //   cdk deploy -c adminUser=admin -c adminPassword=<secret>
@@ -69,6 +79,7 @@ export class MathModelerStack extends Stack {
       orchestratorArn: orchestrator.arn,
       bucket,
       memory,
+      chatHistoryTable,
       adminUser,
       adminPassword,
     });
@@ -77,6 +88,7 @@ export class MathModelerStack extends Stack {
     new CfnOutput(this, 'DocBucketName', { value: bucket.bucketName });
     new CfnOutput(this, 'MemoryId', { value: memory.memoryId });
     new CfnOutput(this, 'OrchestratorArn', { value: orchestrator.arn });
+    new CfnOutput(this, 'ChatHistoryTableName', { value: chatHistoryTable.tableName });
     new CfnOutput(this, 'PortalEndpoint', { value: portal.url });
   }
 }

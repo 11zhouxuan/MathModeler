@@ -220,3 +220,5 @@ __marimo__/
 
 # Memory bank (local only, not committed)
 memory-bank/
+mathmodeler/jobs/
+mathmodeler/report/
