@@ -4,12 +4,12 @@ After the 5→1 agents-as-tools refactor the four sub-agents are no longer
 separate Runtimes — their logic lives in ``mm_common.runners.run_*`` and is
 called in-process by the Orchestrator's ``invoke_*`` tools. These tests exercise
 those runners directly: replace ``runners.llm.build_agent`` with a fake whose
-``__call__`` writes the expected S3 artifacts (simulating the LLM's tool use),
-then assert each runner returns the correct S3-derived §3 response.
+``__call__`` writes the expected workspace artifacts (simulating the LLM's tool use),
+then assert each runner returns the correct workspace-derived §3 response.
 """
 from __future__ import annotations
 
-from mm_common import runners, s3_io
+from mm_common import runners, workspace
 
 
 class FakeAgent:
@@ -30,11 +30,11 @@ def test_run_analyst_reconstructs_order_from_s3(doc_bucket, monkeypatch):
     sid = "mm-sess-analyst-000000000000000000"
 
     def writer(_task):
-        s3_io.put_text(sid, "analysis/problem_analysis.md", "# analysis")
-        s3_io.put_json(sid, "analysis/task_descriptions.json",
+        workspace.write_text(sid, "analysis/problem_analysis.md", "# analysis")
+        workspace.write_json(sid, "analysis/task_descriptions.json",
                        [{"id": "1", "title": "t1", "description": "d1"},
                         {"id": "2", "title": "t2", "description": "d2"}])
-        s3_io.put_json(sid, "analysis/dag.json", {"1": [], "2": ["1"]})
+        workspace.write_json(sid, "analysis/dag.json", {"1": [], "2": ["1"]})
 
     _patch_build_agent(monkeypatch, writer)
     monkeypatch.setattr(runners, "analyst_tools", lambda sid_: [])
@@ -43,7 +43,6 @@ def test_run_analyst_reconstructs_order_from_s3(doc_bucket, monkeypatch):
     assert resp["ok"] is True
     assert resp["order"] == ["1", "2"]
     assert resp["tasknum"] == 2
-    assert resp["dag_key"].endswith("analysis/dag.json")
 
 
 def test_run_modeler_reconstructs_modeling_from_s3(doc_bucket, monkeypatch):
@@ -51,7 +50,7 @@ def test_run_modeler_reconstructs_modeling_from_s3(doc_bucket, monkeypatch):
 
     def writer(_task):
         # Simulate the actor->critic loop: 2 rounds recorded alongside the result.
-        s3_io.put_json(sid, "modeling/1.json", {
+        workspace.write_json(sid, "modeling/1.json", {
             "task_analysis": "a", "task_modeling_formulas": "x=1",
             "task_modeling_method": "MIP", "retrieved_methods": ["MIP", "LP"],
             "critic_rounds": [
@@ -82,7 +81,6 @@ def test_modeler_tools_expose_critique_self_evaluation():
     tools = modeler_tools("mm-sess-modeler-000000000000000000", retriever=None)
     names = {getattr(t, "__name__", getattr(t, "tool_name", "")) for t in tools}
     assert "critique_modeling" in names
-    assert "save_modeling" in names
     assert "retrieve_hmml_methods" in names
 
 
@@ -90,15 +88,18 @@ def test_run_reporter_reconstructs_report_from_s3(doc_bucket, monkeypatch):
     sid = "mm-sess-reporter-00000000000000000"
 
     def writer(_task):
-        s3_io.put_text(sid, "report/report.md", "# Final Report")
+        # The reporter now writes a PDF; simulate by writing the pdf file
+        workspace.write_text(sid, "report/report.tex", "\\documentclass{article}")
+        import pathlib
+        pdf_path = pathlib.Path(workspace.session_path(sid)) / "report" / "report.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4 fake")
 
     _patch_build_agent(monkeypatch, writer)
     monkeypatch.setattr(runners, "reporter_tools", lambda sid_: [])
 
     resp = runners.run_reporter({"session_id": sid, "problem": "P", "order": ["1"]})
     assert resp["ok"] is True
-    assert resp["report_key"].endswith("report/report.md")
-    assert resp["report_url"]  # presigned URL non-empty
+    assert resp["pdf_exists"] is True
 
 
 def test_run_solver_reconstructs_result_from_s3(doc_bucket, monkeypatch):
@@ -109,8 +110,8 @@ def test_run_solver_reconstructs_result_from_s3(doc_bucket, monkeypatch):
     monkeypatch.setattr(runners.CodeInterpreterClient, "stop", lambda self: None)
 
     def writer(_task):
-        s3_io.put_text(sid, "solving/1.py", "print(42)", content_type="text/x-python")
-        s3_io.put_json(sid, "solving/1.json", {
+        workspace.write_text(sid, "solving/1.py", "print(42)")
+        workspace.write_json(sid, "solving/1.json", {
             "success": True, "attempts": 2, "stdout": "42\n",
             "artifacts": ["solving/1/artifacts/plot.png"]})
 

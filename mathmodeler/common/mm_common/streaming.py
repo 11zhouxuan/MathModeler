@@ -492,8 +492,21 @@ class StrandsToAISDK:
                     changed = True
 
         # 3) Token deltas (sub-agent narration) -> a text part.
+        # However, if there's a currently-active tool (input-available but no
+        # output yet), append to its output field so stdout_chunk from
+        # execute_code renders inside the tool card, not as separate text.
         if "data" in sub and sub["data"]:
-            acc.add_text(sub["data"])
+            # Find the last tool that's still running (no output yet).
+            active_tool_id = None
+            for tid, part in acc._tools.items():
+                if part.get("state") == "input-available":
+                    active_tool_id = tid
+            if active_tool_id:
+                part = acc._tools[active_tool_id]
+                existing = part.get("output") or ""
+                part["output"] = existing + sub["data"]
+            else:
+                acc.add_text(sub["data"])
             changed = True
 
         # 4) Final result text -> stage done + the result as a text part.

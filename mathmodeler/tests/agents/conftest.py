@@ -153,7 +153,7 @@ def make_fake_supervisor_stack(*, ask=False):
         if n < len(plan):
             name, subtask = plan[n]
             return {"tool": "run_subagent",
-                    "input": {"name": name, "subtask": subtask}, "id": f"sup-{n}"}
+                    "input": {"description": f"运行{name}", "name": name, "subtask": subtask}, "id": f"sup-{n}"}
         return {"text": "FINAL: report assembled."}
 
     supervisor = Agent(model=_build_fake_model(sup_planner), system_prompt="sup",

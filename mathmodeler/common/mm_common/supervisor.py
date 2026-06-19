@@ -134,20 +134,20 @@ class Supervisor:
 
     def _make_ask_user(self):
         @tool(context=True)
-        def ask_user(tool_context, question: str, type: str = "text") -> str:
+        def ask_user(tool_context, question: str, prompt_type: str = "text") -> str:
             """Ask the end user a question and wait for their answer.
 
             Args:
                 question: The question to ask the user.
-                type: Interaction type. One of:
+                prompt_type: Interaction type. One of:
                     - "text": User types a free-form text answer (default).
                     - "confirm": User clicks a Confirm or Modify button.
                     - "choice": User selects from options listed in the question.
             """
-            logger.info("[supervisor] ask_user -> %r (type=%s)", question, type)
+            logger.info("[supervisor] ask_user -> %r (prompt_type=%s)", question, prompt_type)
             return tool_context.interrupt(
                 "supervisor-ask",
-                reason={"agent": "supervisor", "question": question, "inputType": type},
+                reason={"agent": "supervisor", "question": question, "inputType": prompt_type},
             )
 
 

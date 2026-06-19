@@ -30,14 +30,18 @@ class _FakeClient:
         }
 
     def invoke_model(self, modelId, body):
-        text = json.loads(body)["text"]
+        # Nova 2 MME SINGLE_EMBEDDING schema: text is at
+        # singleEmbeddingParams.text.value; vector returned under embeddings[].
+        parsed = json.loads(body)
+        text = parsed["singleEmbeddingParams"]["text"]["value"]
         self.calls.append((modelId, text))
         vec = [0.0, 0.0, 1.0]
         for key, v in self._vecs.items():
             if key in text:
                 vec = v
                 break
-        return {"body": _FakeBody({"embedding": vec})}
+        return {"body": _FakeBody({"embeddings": [{"embeddingType": "float", "embedding": vec}]})}
+
 
 
 @pytest.fixture

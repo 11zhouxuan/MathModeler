@@ -113,10 +113,11 @@ function Console() {
         const msgs = await loadMessagesAsync(urlSession);
         setInitial(msgs as ChatMessage[]);
       } else {
-        // Start a new session
+        // Start a new session and push its ID into the URL
         const id = newSessionId();
         setCurrentId(id);
         setInitial([]);
+        router.replace(`/?session=${id}`, { scroll: false });
       }
       setLoading(false);
     })();
