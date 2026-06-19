@@ -28,6 +28,8 @@ export function Chat({
   const token = auth.user?.access_token || '';
   const [input, setInput] = useState('');
   const resumeRef = useRef<{ interruptId: string } | null>(null);
+  // Track whether we've done the first early save (so session appears in sidebar immediately).
+  const didEarlySaveRef = useRef<boolean>(initialMessages.length > 0);
   // Stable, frontend-owned session id (the backend reuses any session_id it gets).
   const sessionRef = useRef<string>(id || newSessionId());
 
@@ -130,6 +132,17 @@ export function Chat({
     document.addEventListener('mm-quick-reply', handler);
     return () => document.removeEventListener('mm-quick-reply', handler);
   }, [sendMessage, busy]);
+
+  // Early save: persist as soon as the first user message is sent so the
+  // session appears in the sidebar immediately (even while still streaming).
+  useEffect(() => {
+    if (didEarlySaveRef.current || messages.length === 0) return;
+    // Only trigger once per session (when transitioning from empty -> has messages).
+    didEarlySaveRef.current = true;
+    saveSession(id, messages as any[]);
+    onPersisted?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messages]);
 
   // Persist to localStorage history when the conversation grows (and idle).
   useEffect(() => {
