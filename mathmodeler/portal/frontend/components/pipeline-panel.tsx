@@ -161,7 +161,7 @@ interface FileTreeItem {
 // ---------------------------------------------------------------------------
 // File Browser component
 // ---------------------------------------------------------------------------
-function FileBrowser({ sessionId }: { sessionId: string | null }) {
+function FileBrowser({ sessionId, onPreviewFile }: { sessionId: string | null; onPreviewFile?: (relPath: string, name: string) => void }) {
   const [tree, setTree] = useState<FileTreeItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -254,6 +254,7 @@ function FileBrowser({ sessionId }: { sessionId: string | null }) {
             item={item}
             depth={0}
             onDownload={handleDownload}
+            onPreview={onPreviewFile}
           />
         ))}
       </div>
@@ -265,10 +266,12 @@ function FileTreeNode({
   item,
   depth,
   onDownload,
+  onPreview,
 }: {
   item: FileTreeItem;
   depth: number;
   onDownload: (relPath: string, name: string) => void;
+  onPreview?: (relPath: string, name: string) => void;
 }) {
   const [expanded, setExpanded] = useState(depth < 2);
 
@@ -294,6 +297,7 @@ function FileTreeNode({
             item={child}
             depth={depth + 1}
             onDownload={onDownload}
+            onPreview={onPreview}
           />
         ))}
       </div>
@@ -311,15 +315,17 @@ function FileTreeNode({
 
   return (
     <div
-      className="flex items-center gap-1.5 py-0.5 px-1 rounded hover:bg-accent group"
+      className="flex items-center gap-1.5 py-0.5 px-1 rounded hover:bg-accent group cursor-pointer"
       style={{ paddingLeft: `${depth * 12 + 4}px` }}
+      onClick={() => onPreview?.(item.rel_path, item.name)}
+      title="点击预览"
     >
       <FileIcon className="size-3.5 text-muted-foreground shrink-0" />
       <span className="text-xs text-foreground truncate flex-1">{item.name}</span>
       <span className="text-[10px] text-muted-foreground shrink-0">{sizeStr}</span>
       <button
         type="button"
-        onClick={() => onDownload(item.rel_path, item.name)}
+        onClick={(e) => { e.stopPropagation(); onDownload(item.rel_path, item.name); }}
         className="opacity-0 group-hover:opacity-100 rounded p-0.5 text-muted-foreground hover:text-foreground transition-opacity"
         title="下载"
       >
@@ -335,9 +341,11 @@ function FileTreeNode({
 export function PipelinePanel({
   tasks,
   sessionId,
+  onPreviewFile,
 }: {
   tasks: TaskItem[];
   sessionId?: string | null;
+  onPreviewFile?: (relPath: string, name: string) => void;
 }) {
   const [collapsed, setCollapsed] = useState(false);
   const [activeTab, setActiveTab] = useState<'dag' | 'files'>('dag');
@@ -435,7 +443,7 @@ export function PipelinePanel({
             </div>
           </>
         ) : (
-          <FileBrowser sessionId={sessionId ?? null} />
+          <FileBrowser sessionId={sessionId ?? null} onPreviewFile={onPreviewFile} />
         )}
       </div>
     </aside>
