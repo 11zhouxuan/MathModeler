@@ -510,6 +510,17 @@ async def save_session_messages(session_id: str, request: Request, _: None = Dep
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
+@app.delete("/api/sessions/{session_id}")
+async def delete_session_route(session_id: str, _: None = Depends(_require_auth)) -> JSONResponse:
+    """Delete a chat session from DynamoDB."""
+    from mm_common import chat_store
+    try:
+        chat_store.delete_session(session_id)
+        return JSONResponse({"ok": True, "deleted": session_id})
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
 # --- workspace file browser API (session files) ----------------------------
 # These routes expose the session workspace files for the frontend file browser
 # panel. In local dev, workspace is ./jobs/{session_id}/; in Runtime it's

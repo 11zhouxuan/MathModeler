@@ -108,9 +108,23 @@ export function saveSession(id: string, messages: any[]): SessionMeta[] {
 }
 
 export function deleteSession(id: string): SessionMeta[] {
-  // For now, just remove from cached list (no backend delete API yet).
+  // Remove from local cache immediately (optimistic update).
   _cachedSessions = _cachedSessions.filter((s) => s.id !== id);
+  // Fire async DELETE to backend (best-effort).
+  deleteSessionAsync(id);
   return _cachedSessions;
+}
+
+export async function deleteSessionAsync(id: string): Promise<void> {
+  if (!id) return;
+  try {
+    await fetch(`${API_BASE}/api/sessions/${id}`, {
+      method: 'DELETE',
+      headers: _headers(),
+    });
+  } catch {
+    // Best-effort; silent failure.
+  }
 }
 
 export function getCollapsed(): boolean {
