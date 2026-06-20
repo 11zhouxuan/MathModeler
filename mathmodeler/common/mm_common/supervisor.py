@@ -384,6 +384,49 @@ class Supervisor:
 
         return run_subagent
 
+    # ----------------------------------------------------------------- resume
+    def _prepare_resume_prompt(self, resume: Any) -> Any:
+        """Prepare the prompt for a HITL resume invocation.
+
+        Strands expects interruptResponses as-is when ``_interrupt_state.activated``
+        is True (the normal path when state was properly serialized/restored). If
+        the interrupt state was NOT restored (e.g. MemoryStateStore lost state across
+        process restarts, or S3 restore failed silently), we fall back to passing
+        the user's answer as a plain string so the supervisor at least gets the
+        response (it will start fresh rather than crash with a ValueError).
+        """
+        ist = getattr(self.supervisor, "_interrupt_state", None)
+        activated = getattr(ist, "activated", False) if ist else False
+        logger.info(
+            "[supervisor] _prepare_resume_prompt: interrupt_state.activated=%s, "
+            "resume type=%s",
+            activated, type(resume).__name__,
+        )
+        if activated:
+            # Normal path: Strands will call _interrupt_state.resume(prompt)
+            # which validates and stores the interrupt responses, then
+            # _convert_prompt_to_messages short-circuits to [].
+            return resume
+        else:
+            # Fallback: state not properly restored. Extract the user's answer
+            # text and pass as a plain string prompt so the agent doesn't crash.
+            logger.warning(
+                "[supervisor] interrupt_state NOT activated on resume — "
+                "state restore likely failed. Falling back to string prompt."
+            )
+            answer = self._extract_answer_from_resume(resume)
+            return answer or "继续"
+
+    def _extract_answer_from_resume(self, resume: Any) -> str:
+        """Extract the user's answer text from interruptResponses."""
+        if isinstance(resume, list):
+            for item in resume:
+                ir = item.get("interruptResponse", {}) if isinstance(item, dict) else {}
+                resp = ir.get("response", "")
+                if resp:
+                    return str(resp)
+        return ""
+
     # ----------------------------------------------------------------- stream
     async def stream(self, task: Any = None, *, resume: Any = None):
         """Async generator over raw Strands events for one request.
@@ -394,7 +437,10 @@ class Supervisor:
         After the supervisor stops, a domain ``{"mm": {...}}`` event is yielded:
         either ``{"type":"ask",...}`` (paused on HITL) or ``{"type":"final",...}``.
         """
-        prompt = resume if resume is not None else task
+        if resume is not None:
+            prompt = self._prepare_resume_prompt(resume)
+        else:
+            prompt = task
         result = None
         async for ev in self.supervisor.stream_async(prompt):
             yield ev
