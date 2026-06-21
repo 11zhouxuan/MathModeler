@@ -297,7 +297,16 @@ def solver_tools(session_id: str, ci) -> list:
         Returns {ok, stdout, stderr}.
         """
         try:
-            return ci.read_files([path])
+            read_code = (
+                f"import sys, os\n"
+                f"path = {path!r}\n"
+                f"if not os.path.exists(path):\n"
+                f"    print('FILE_NOT_FOUND: ' + path, file=sys.stderr)\n"
+                f"else:\n"
+                f"    print(open(path).read())\n"
+            )
+            result = ci.execute(read_code)
+            return {"ok": result.get("ok", False), "stdout": result.get("stdout", ""), "stderr": result.get("stderr", "")}
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "stdout": "", "stderr": str(e)}
 
