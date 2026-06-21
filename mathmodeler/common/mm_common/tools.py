@@ -227,8 +227,11 @@ def solver_tools(session_id: str, ci) -> list:
                 if new_text:
                     offset += len(new_text.encode("utf-8"))
                     yield {"stdout_chunk": new_text}
+                else:
+                    # Heartbeat: keep the SSE connection alive during long CI executions
+                    yield {"heartbeat": True}
             except Exception:  # noqa: BLE001
-                pass
+                yield {"heartbeat": True}
 
         # Check timeout
         if thread.is_alive():

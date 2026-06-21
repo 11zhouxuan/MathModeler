@@ -28,16 +28,24 @@ def _get_client():
 
 
 def _iter_data_lines(response):
-    """Yield decoded ``data:`` payloads from an SSE response stream."""
+    """Yield decoded ``data:`` payloads from an SSE response stream.
+
+    Also yields empty string for SSE comments (`:` lines) so the caller
+    can emit a keepalive to its own downstream connection.
+    """
     for line in response["response"].iter_lines():
         if not line:
             continue
         if isinstance(line, bytes):
             if line.startswith(b"data: "):
                 yield line[6:].decode()
+            elif line.startswith(b":"):
+                yield ""
         else:  # already a str
             if line.startswith("data: "):
                 yield line[6:]
+            elif line.startswith(":"):
+                yield ""
 
 
 def invoke_agent(agent_arn: str, payload: dict, session_id: str) -> dict:

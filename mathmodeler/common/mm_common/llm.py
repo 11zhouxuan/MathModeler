@@ -42,8 +42,34 @@ def make_model(temperature: float = 0.0, max_tokens: int = 16384):
 
 
 
+def make_session_manager(session_id: str, agent_name: str):
+    """Create an AgentCoreMemorySessionManager for persisting agent chat history.
+
+    Each agent gets its own memory session: "{session_id}/{agent_name}".
+    Returns None if MEMORY_ID is not configured (local dev).
+    """
+    if not config.MEMORY_ID:
+        return None
+    try:
+        from bedrock_agentcore.memory.integrations.strands.session_manager import AgentCoreMemorySessionManager
+        from bedrock_agentcore.memory.integrations.strands.config import AgentCoreMemoryConfig
+
+        memory_config = AgentCoreMemoryConfig(
+            memory_id=config.MEMORY_ID,
+            session_id=f"{session_id}/{agent_name}",
+            actor_id="system",
+        )
+        return AgentCoreMemorySessionManager(
+            agentcore_memory_config=memory_config,
+            region_name=config.REGION,
+        )
+    except Exception:
+        return None
+
+
 def build_agent(system_prompt: str, tools: list, temperature: float = 0.0,
-                max_tokens: int = 16384, *, streaming: bool = True):
+                max_tokens: int = 16384, *, streaming: bool = True,
+                session_manager=None):
     """Construct a tool-using Strands Agent (agents-as-tools).
 
     ``tools`` is a list of ``@tool``-decorated functions.
@@ -62,6 +88,8 @@ def build_agent(system_prompt: str, tools: list, temperature: float = 0.0,
     }
     if streaming:
         kwargs["callback_handler"] = None
+    if session_manager is not None:
+        kwargs["session_manager"] = session_manager
     return Agent(**kwargs)
 
 

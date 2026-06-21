@@ -4,4 +4,4 @@ pydantic
 strands-agents
 boto3
 numpy
-bedrock-agentcore
+bedrock-agentcore[strands-agents]

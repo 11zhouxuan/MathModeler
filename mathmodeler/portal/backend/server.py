@@ -305,6 +305,9 @@ def _iter_chat_stream(body: dict):
         for raw in invoke.stream_agent(AGENT_ARN, payload, sid):
             raw = raw.strip()
             if not raw:
+                # Empty string = upstream SSE comment (heartbeat); forward as
+                # SSE comment to keep ALB → browser connection alive.
+                yield ":\n\n"
                 continue
             # The orchestrator already speaks AI SDK v6 wire frames; relay as-is.
             # Suppress the orchestrator's own [DONE] so we can append our own.

@@ -418,6 +418,10 @@ class StrandsToAISDK:
         sub = tse.get("data")
         if not isinstance(sub, dict):
             return
+        # Heartbeat from execute_code polling — emit SSE comment to keep connection alive
+        if sub.get("heartbeat"):
+            yield ":heartbeat\n\n"
+            return
         node = sub.get("node") or agent_name
 
         # Stage start/done markers -> data-stage (right rail). "start" also marks

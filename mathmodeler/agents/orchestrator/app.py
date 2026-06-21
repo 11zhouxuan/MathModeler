@@ -142,7 +142,9 @@ def _state_store():
 
 def build_supervisor(session_id: str) -> Supervisor:
     """Construct the MathModeler Supervisor with the four in-process sub-agents."""
-    supervisor_agent = build_agent(SUPERVISOR_SYSTEM, tools=list(BUILTIN_TOOLS))
+    from mm_common.llm import make_session_manager
+    sm = make_session_manager(session_id, "supervisor")
+    supervisor_agent = build_agent(SUPERVISOR_SYSTEM, tools=list(BUILTIN_TOOLS), session_manager=sm)
     subagents = {
         "analyst": build_analyst_agent(session_id),
         "modeler": build_modeler_agent(session_id),
