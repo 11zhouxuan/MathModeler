@@ -100,6 +100,8 @@ function Console() {
   const [loading, setLoading] = useState(true);
 
   // Load sessions from server on mount; handle ?session= URL param.
+  // Only run once on mount — subsequent navigation (startNew/pick) updates
+  // state directly without triggering a full reload.
   useEffect(() => {
     (async () => {
       setLoading(true);
@@ -108,12 +110,10 @@ function Console() {
 
       const urlSession = searchParams.get('session');
       if (urlSession && urlSession.startsWith('mm-')) {
-        // Load existing session from URL
         setCurrentId(urlSession);
         const msgs = await loadMessagesAsync(urlSession);
         setInitial(msgs as ChatMessage[]);
       } else {
-        // Start a new session and push its ID into the URL
         const id = newSessionId();
         setCurrentId(id);
         setInitial([]);
@@ -121,7 +121,8 @@ function Console() {
       }
       setLoading(false);
     })();
-  }, [searchParams]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const refresh = useCallback(async () => {
     const list = await listSessionsAsync();
@@ -148,7 +149,8 @@ function Console() {
   }, [currentId, router]);
 
   const remove = useCallback((id: string) => {
-    setSessions(deleteSession(id));
+    setSessions((prev) => prev.filter((s) => s.id !== id));
+    deleteSession(id);
     if (id === currentId) startNew();
   }, [currentId, startNew]);
 

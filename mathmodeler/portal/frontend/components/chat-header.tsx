@@ -11,7 +11,7 @@ export function ChatHeader() {
         <span className="flex size-7 items-center justify-center rounded-md bg-primary/10 text-primary">
           <SigmaIcon className="size-4" />
         </span>
-        Math<span className="text-primary">Modeler</span>
+        <span>Math<span className="text-primary">Modeler</span></span>
       </div>
     </header>
   );
