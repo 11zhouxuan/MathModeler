@@ -212,6 +212,7 @@ class Supervisor:
         subagents = self.subagents
         completed = self._completed
         supervisor = self.supervisor
+        _sup_self = self
 
 
         async def _drive(sub, name, prompt):
@@ -370,6 +371,8 @@ class Supervisor:
             text = _extract_text(r)
             completed[ckey] = text
             logger.info("[supervisor] subagent %r DONE (result %d chars)", name, len(text))
+            # Persist after each sub-agent completes so progress survives disconnects.
+            _sup_self._persist()
 
             yield {"node": name, "result_text": text}
             # async-gen tool: the LAST yield is the tool result (decorator.py:618-623).

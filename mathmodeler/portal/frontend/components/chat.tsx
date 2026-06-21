@@ -98,6 +98,10 @@ export function Chat({
     let pendingAsk: Ask | null = null;
     let tasks: TaskItem[] = [];
     for (const m of messages as any[]) {
+      // A user message after a data-ask means the ask was already answered.
+      if (m.role === 'user' && pendingAsk) {
+        pendingAsk = null;
+      }
       for (const p of m.parts || []) {
         if (p.type === 'data-session') {
           const sid = p.data?.session_id;

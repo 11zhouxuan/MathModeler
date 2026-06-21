@@ -199,6 +199,14 @@ async def stream_supervisor(body: dict):
         sup.restore(_state_store().load(session_id))
         gen = sup.stream(resume=interrupt_responses)
     else:
+        # Try to restore previous state so _completed cache is loaded.
+        # This allows the supervisor to skip already-finished sub-agents
+        # when a session is continued after a disconnect.
+        saved = _state_store().load(session_id)
+        if saved and saved.get("completed"):
+            logger.info("[orchestrator] CONTINUE session=%s (restoring %d completed tasks)",
+                        session_id, len(saved["completed"]))
+            sup.restore(saved)
         task = _build_task(body)
         logger.info("[orchestrator] START session=%s (task %d chars)", session_id, len(task))
         gen = sup.stream(task=task)
