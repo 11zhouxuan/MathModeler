@@ -1,4 +1,9 @@
 @import "tailwindcss";
+/* Explicit source paths for Tailwind v4 content detection in Docker */
+@source "../components";
+@source "../lib";
+@source "../hooks";
+@source "../app";
 @import "katex/dist/katex.min.css";
 
 /* include utility classes in streamdown */
