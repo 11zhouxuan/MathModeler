@@ -1,9 +1,11 @@
 import * as path from 'path';
 import { Construct } from 'constructs';
+import * as cdk from 'aws-cdk-lib';
 import * as agentcore from '@aws-cdk/aws-bedrock-agentcore-alpha';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import { Platform } from 'aws-cdk-lib/aws-ecr-assets';
+import { CfnRuntime } from 'aws-cdk-lib/aws-bedrockagentcore';
 
 const REPO_ROOT = path.join(__dirname, '..', '..'); // mathmodeler/
 
@@ -104,6 +106,12 @@ export class AgentRuntime extends Construct {
         ...(props.extraEnv ?? {}),
       },
     });
+
+    // Escape hatch: L2 construct doesn't expose filesystemConfigurations yet.
+    const cfnRuntime = runtime.node.defaultChild as CfnRuntime;
+    cfnRuntime.addPropertyOverride('FilesystemConfigurations', [
+      { SessionStorage: { MountPath: '/mnt/workspace' } },
+    ]);
 
     this.arn = runtime.agentRuntimeArn;
   }

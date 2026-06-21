@@ -89,7 +89,7 @@ export class PortalFargate extends Construct {
     // (``<runtimeArn>/runtime-endpoint/DEFAULT``), so the policy must cover both
     // the runtime ARN and its endpoint sub-paths.
     taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
-      actions: ['bedrock-agentcore:InvokeAgentRuntime'],
+      actions: ['bedrock-agentcore:InvokeAgentRuntime', 'bedrock-agentcore:InvokeAgentRuntimeCommand'],
       resources: [props.orchestratorArn, `${props.orchestratorArn}/*`],
     }));
 

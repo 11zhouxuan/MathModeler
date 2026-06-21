@@ -522,42 +522,133 @@ async def delete_session_route(session_id: str, _: None = Depends(_require_auth)
 
 
 # --- workspace file browser API (session files) ----------------------------
-# These routes expose the session workspace files for the frontend file browser
-# panel. In local dev, workspace is ./jobs/{session_id}/; in Runtime it's
-# /mnt/workspace/jobs/{session_id}/.
+# In deployed mode (AGENT_CORE_ARN set), files live inside the AgentCore Runtime
+# container's managed session storage (/mnt/workspace/jobs/{session_id}/).
+# Portal fetches them via InvokeAgentRuntimeCommand (shell commands in the same
+# runtime session). In local dev, falls back to reading from the local filesystem.
+
+_WORKSPACE_PREFIX = "/mnt/workspace/jobs"
+
+
+def _use_runtime_files() -> bool:
+    """True when we should fetch files from the runtime (deployed mode)."""
+    return bool(AGENT_ARN)
+
 
 @app.get("/api/files/{session_id}")
 async def list_session_files(session_id: str, _: None = Depends(_require_auth)) -> JSONResponse:
     """List all files in a session workspace as a tree structure."""
-    from mm_common import workspace
-    tree = workspace.list_tree(session_id)
-    return JSONResponse({"session_id": session_id, "tree": tree})
+    if _use_runtime_files():
+        from mm_common import invoke
+        try:
+            cmd = (
+                f'find {_WORKSPACE_PREFIX}/{session_id} -type f '
+                f'-printf "%s\\t%P\\n" 2>/dev/null'
+            )
+            stdout, _, exit_code = invoke.runtime_command(AGENT_ARN, session_id, cmd)
+            if exit_code != 0 or not stdout.strip():
+                return JSONResponse({"session_id": session_id, "tree": []})
+            tree = _parse_find_output(stdout)
+            return JSONResponse({"session_id": session_id, "tree": tree})
+        except Exception as e:
+            logger.warning("[portal] runtime_command list_files failed: %s", e)
+            return JSONResponse({"session_id": session_id, "tree": []})
+    else:
+        from mm_common import workspace
+        tree = workspace.list_tree(session_id)
+        return JSONResponse({"session_id": session_id, "tree": tree})
+
+
+def _parse_find_output(stdout: str) -> list[dict]:
+    """Parse `find -printf '%s\\t%P\\n'` output into a nested tree structure."""
+    files: list[tuple[int, str]] = []
+    for line in stdout.strip().splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2:
+            size, rel_path = int(parts[0]), parts[1]
+            files.append((size, rel_path))
+
+    root: list[dict] = []
+    dirs_map: dict[str, list[dict]] = {"": root}
+
+    for size, rel_path in sorted(files, key=lambda x: x[1]):
+        segments = rel_path.split("/")
+        # Ensure parent directories exist in tree
+        for i in range(1, len(segments)):
+            dir_path = "/".join(segments[:i])
+            parent_path = "/".join(segments[:i-1])
+            if dir_path not in dirs_map:
+                dir_node = {
+                    "name": segments[i-1],
+                    "rel_path": dir_path,
+                    "is_dir": True,
+                    "children": [],
+                }
+                dirs_map[dir_path] = dir_node["children"]
+                dirs_map.setdefault(parent_path, root).append(dir_node)
+        # Add file node
+        parent_path = "/".join(segments[:-1])
+        dirs_map.setdefault(parent_path, root).append({
+            "name": segments[-1],
+            "rel_path": rel_path,
+            "is_dir": False,
+            "size": size,
+        })
+    return root
 
 
 @app.get("/api/files/{session_id}/{file_path:path}")
 async def download_session_file(session_id: str, file_path: str, _: None = Depends(_require_auth)):
     """Download a specific file from the session workspace."""
-    from mm_common import workspace
+    if _use_runtime_files():
+        from mm_common import invoke
+        from fastapi.responses import Response
 
-    full_path = workspace.file_path(session_id, file_path)
-    # Security: ensure the resolved path is within the session workspace
-    session_root = workspace.session_path(session_id)
-    try:
-        full_path.resolve().relative_to(session_root.resolve())
-    except ValueError:
-        raise HTTPException(status_code=403, detail="path traversal denied")
+        # Security: reject path traversal
+        if ".." in file_path:
+            raise HTTPException(status_code=403, detail="path traversal denied")
 
-    if not full_path.exists() or not full_path.is_file():
-        raise HTTPException(status_code=404, detail=f"file not found: {file_path}")
+        full_remote = f"{_WORKSPACE_PREFIX}/{session_id}/{file_path}"
+        try:
+            # Use base64 encoding for safe binary transfer
+            cmd = f'base64 "{full_remote}" 2>/dev/null'
+            stdout, _, exit_code = invoke.runtime_command(AGENT_ARN, session_id, cmd, timeout=30)
+            if exit_code != 0 or not stdout.strip():
+                raise HTTPException(status_code=404, detail=f"file not found: {file_path}")
+            data = base64.b64decode(stdout.strip())
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning("[portal] runtime_command download failed: %s", e)
+            raise HTTPException(status_code=502, detail="runtime unavailable")
 
-    # Determine content type
-    ctype = mimetypes.guess_type(str(full_path))[0] or "application/octet-stream"
-    return FileResponse(
-        str(full_path),
-        media_type=ctype,
-        filename=full_path.name,
-        headers={"Content-Disposition": f'attachment; filename="{full_path.name}"'},
-    )
+        filename = file_path.rsplit("/", 1)[-1]
+        ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        return Response(
+            content=data,
+            media_type=ctype,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    else:
+        from mm_common import workspace
+
+        full_path = workspace.file_path(session_id, file_path)
+        session_root = workspace.session_path(session_id)
+        try:
+            full_path.resolve().relative_to(session_root.resolve())
+        except ValueError:
+            raise HTTPException(status_code=403, detail="path traversal denied")
+
+        if not full_path.exists() or not full_path.is_file():
+            raise HTTPException(status_code=404, detail=f"file not found: {file_path}")
+
+        ctype = mimetypes.guess_type(str(full_path))[0] or "application/octet-stream"
+        return FileResponse(
+            str(full_path),
+            media_type=ctype,
+            filename=full_path.name,
+            headers={"Content-Disposition": f'attachment; filename="{full_path.name}"'},
+        )
 
 
 # --- static frontend -------------------------------------------------------

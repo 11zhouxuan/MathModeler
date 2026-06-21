@@ -58,3 +58,33 @@ def stream_agent(agent_arn: str, payload: dict, session_id: str):
         accept="text/event-stream",
     )
     yield from _iter_data_lines(resp)
+
+
+def runtime_command(agent_arn: str, session_id: str, command: str, timeout: int = 30) -> tuple[str, str, int]:
+    """Execute a shell command in the runtime session via InvokeAgentRuntimeCommand.
+
+    Returns (stdout, stderr, exit_code). Raises RuntimeError if the session
+    is unavailable (e.g. timed out / not yet started).
+    """
+    resp = _get_client().invoke_agent_runtime_command(
+        agentRuntimeArn=agent_arn,
+        runtimeSessionId=session_id,
+        qualifier="DEFAULT",
+        contentType="application/json",
+        accept="application/vnd.amazon.eventstream",
+        body={"command": command, "timeout": timeout},
+    )
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    exit_code = -1
+    for event in resp.get("stream", []):
+        chunk = event.get("chunk", {})
+        delta = chunk.get("contentDelta", {})
+        if delta.get("stdout"):
+            stdout_parts.append(delta["stdout"])
+        if delta.get("stderr"):
+            stderr_parts.append(delta["stderr"])
+        stop = chunk.get("contentStop", {})
+        if "exitCode" in stop:
+            exit_code = stop["exitCode"]
+    return "".join(stdout_parts), "".join(stderr_parts), exit_code
