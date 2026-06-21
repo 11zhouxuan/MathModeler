@@ -17,8 +17,13 @@ def _get_client():
     global _client
     if _client is None:
         import boto3
+        from botocore.config import Config
 
-        _client = boto3.client("bedrock-agentcore", region_name=config.REGION)
+        _client = boto3.client(
+            "bedrock-agentcore",
+            region_name=config.REGION,
+            config=Config(read_timeout=600, connect_timeout=10),
+        )
     return _client
 
 
