@@ -171,17 +171,22 @@ class StrandsToAISDK:
         HEARTBEAT_INTERVAL = 15  # seconds — keep connection alive during model thinking
         try:
             aiter = event_stream.__aiter__()
+            next_task = None
             while True:
-                try:
-                    event = await asyncio.wait_for(aiter.__anext__(), timeout=HEARTBEAT_INTERVAL)
-                except StopAsyncIteration:
-                    break
-                except asyncio.TimeoutError:
+                if next_task is None:
+                    next_task = asyncio.ensure_future(aiter.__anext__())
+                done, _ = await asyncio.wait([next_task], timeout=HEARTBEAT_INTERVAL)
+                if done:
+                    next_task = None
+                    try:
+                        event = done.pop().result()
+                    except StopAsyncIteration:
+                        break
+                    for frame in self._process(event):
+                        yield frame
+                else:
                     logger.info("[streaming] heartbeat — no event for %ds, keeping connection alive", HEARTBEAT_INTERVAL)
                     yield ":heartbeat\n\n"
-                    continue
-                for frame in self._process(event):
-                    yield frame
         except Exception as e:  # noqa: BLE001 - surface as an error frame, never crash
             logger.exception("[streaming] event stream failed: %s", e)
             for f in self._ensure_owner("supervisor"):
