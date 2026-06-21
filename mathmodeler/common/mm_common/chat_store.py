@@ -1,13 +1,17 @@
 """mm_common.chat_store — DynamoDB-backed UI chat history persistence.
 
 Stores chat sessions and messages in DynamoDB for cross-browser, cross-device
-access. Inspired by agent-craft's ChatHistoryService but simplified for the
-single-user MathModeler portal.
+access. Follows agent-craft's per-message storage pattern to avoid the 400KB
+item size limit.
 
 Table schema (single-table design):
-  PK = "SESSION"
-  SK = session_id
-  Attributes: title, problem, created_at, updated_at, messages (JSON list)
+  Session metadata:
+    PK = "SESSION", SK = session_id
+    Attributes: title, problem, created_at, updated_at
+
+  Individual messages:
+    PK = "MSG#{session_id}", SK = "{index:06d}"
+    Attributes: role, parts (JSON), msg_id
 
 Environment:
   CHAT_HISTORY_TABLE — DynamoDB table name (default: "MathModeler-ChatHistory")
@@ -17,7 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, Optional
+from typing import Any
 
 from . import config
 
@@ -56,66 +60,62 @@ def save_session(
     problem: str = "",
     title: str | None = None,
 ) -> None:
-    """Upsert a chat session with its full message list.
+    """Upsert a chat session: save metadata + individual messages.
 
-    Called:
-      1. By the portal backend after streaming completes (server-side save).
-      2. By the frontend POST /api/sessions/:id/messages (client-side save).
+    Each message is stored as a separate DynamoDB item to avoid the 400KB limit.
+    Uses BatchWriteItem for efficiency.
     """
-    if not session_id:
+    if not session_id or not messages:
         return
     now = int(time.time())
     derived_title = title or (problem[:24] if problem else "新会话")
 
     try:
-        _ddb().put_item(Item={
+        table = _ddb()
+
+        # 1. Upsert session metadata
+        table.put_item(Item={
             "PK": "SESSION",
             "SK": session_id,
             "title": derived_title,
             "problem": (problem or "")[:500],
-            "created_at": now,  # Will be overwritten on update; acceptable for simplicity
+            "created_at": now,
             "updated_at": now,
-            "messages": json.dumps(messages, ensure_ascii=False, default=str),
+            "msg_count": len(messages),
         })
+
+        # 2. Write messages in batches of 25 (DynamoDB batch limit)
+        with table.batch_writer() as batch:
+            for idx, msg in enumerate(messages):
+                parts_json = json.dumps(msg.get("parts", []), ensure_ascii=False, default=str)
+                # If single message item > 400KB, truncate parts
+                if len(parts_json.encode("utf-8")) > 380_000:
+                    parts_json = json.dumps(
+                        [{"type": "text", "text": "[消息内容过大，已省略]"}],
+                        ensure_ascii=False,
+                    )
+                batch.put_item(Item={
+                    "PK": f"MSG#{session_id}",
+                    "SK": f"{idx:06d}",
+                    "role": msg.get("role", "user"),
+                    "msg_id": msg.get("id", ""),
+                    "parts": parts_json,
+                })
+
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[chat_store] save_session failed for {session_id}: {e}")
 
 
-def update_session_timestamp(session_id: str, title: str | None = None) -> None:
-    """Touch the updated_at timestamp (called during streaming for liveness)."""
-    if not session_id:
-        return
-    now = int(time.time())
-    try:
-        expr = "SET updated_at = :ts"
-        vals: dict = {":ts": now}
-        if title:
-            expr += ", title = :t"
-            vals[":t"] = title
-        _ddb().update_item(
-            Key={"PK": "SESSION", "SK": session_id},
-            UpdateExpression=expr,
-            ExpressionAttributeValues=vals,
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"[chat_store] update_session_timestamp failed: {e}")
-
-
 def list_sessions(limit: int = 50) -> list[dict[str, Any]]:
-    """List all sessions ordered by updated_at descending (most recent first).
-
-    Returns a list of {id, title, updatedAt} dicts for the sidebar.
-    """
+    """List all sessions ordered by updated_at descending (most recent first)."""
     try:
         resp = _ddb().query(
             KeyConditionExpression="PK = :pk",
             ExpressionAttributeValues={":pk": "SESSION"},
             ProjectionExpression="SK, title, updated_at",
-            ScanIndexForward=False,  # DDB sorts by SK; we'll sort client-side
             Limit=limit,
         )
         items = resp.get("Items", [])
-        # Sort by updated_at descending (SK is session_id, not sortable by time)
         items.sort(key=lambda x: int(x.get("updated_at", 0)), reverse=True)
         return [
             {
@@ -131,32 +131,47 @@ def list_sessions(limit: int = 50) -> list[dict[str, Any]]:
 
 
 def load_messages(session_id: str) -> list[dict[str, Any]]:
-    """Load the full messages array for a session."""
+    """Load all messages for a session (ordered by index)."""
     if not session_id:
         return []
     try:
-        resp = _ddb().get_item(
-            Key={"PK": "SESSION", "SK": session_id},
-            ProjectionExpression="messages",
+        resp = _ddb().query(
+            KeyConditionExpression="PK = :pk",
+            ExpressionAttributeValues={":pk": f"MSG#{session_id}"},
+            ScanIndexForward=True,
         )
-        item = resp.get("Item")
-        if not item:
-            return []
-        raw = item.get("messages", "[]")
-        if isinstance(raw, str):
-            return json.loads(raw)
-        return raw if isinstance(raw, list) else []
+        messages = []
+        for item in resp.get("Items", []):
+            parts_raw = item.get("parts", "[]")
+            parts = json.loads(parts_raw) if isinstance(parts_raw, str) else parts_raw
+            messages.append({
+                "id": item.get("msg_id", ""),
+                "role": item.get("role", "user"),
+                "parts": parts,
+            })
+        return messages
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[chat_store] load_messages failed for {session_id}: {e}")
         return []
 
 
 def delete_session(session_id: str) -> None:
-    """Delete a session from the table."""
+    """Delete a session and all its messages."""
     if not session_id:
         return
     try:
-        _ddb().delete_item(Key={"PK": "SESSION", "SK": session_id})
+        table = _ddb()
+        # Delete session metadata
+        table.delete_item(Key={"PK": "SESSION", "SK": session_id})
+        # Delete all message items
+        resp = table.query(
+            KeyConditionExpression="PK = :pk",
+            ExpressionAttributeValues={":pk": f"MSG#{session_id}"},
+            ProjectionExpression="PK, SK",
+        )
+        with table.batch_writer() as batch:
+            for item in resp.get("Items", []):
+                batch.delete_item(Key={"PK": item["PK"], "SK": item["SK"]})
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[chat_store] delete_session failed for {session_id}: {e}")
 
