@@ -33,3 +33,4 @@ EXPOSE 8080
 
 # Single worker keeps the in-process token store + streaming generator simple.
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8080"]
+# cache-bust: 1782017813
