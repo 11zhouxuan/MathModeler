@@ -166,8 +166,20 @@ class StrandsToAISDK:
     # -- public driver ------------------------------------------------------
     async def run(self, event_stream: AsyncIterable[dict]):
         """Yield SSE frames for the whole stream (segmented messages … [DONE])."""
+        import asyncio
+
+        HEARTBEAT_INTERVAL = 15  # seconds — keep connection alive during model thinking
         try:
-            async for event in event_stream:
+            aiter = event_stream.__aiter__()
+            while True:
+                try:
+                    event = await asyncio.wait_for(aiter.__anext__(), timeout=HEARTBEAT_INTERVAL)
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    logger.info("[streaming] heartbeat — no event for %ds, keeping connection alive", HEARTBEAT_INTERVAL)
+                    yield ":heartbeat\n\n"
+                    continue
                 for frame in self._process(event):
                     yield frame
         except Exception as e:  # noqa: BLE001 - surface as an error frame, never crash
