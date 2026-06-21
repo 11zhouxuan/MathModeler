@@ -541,14 +541,15 @@ async def list_session_files(session_id: str, _: None = Depends(_require_auth)) 
     if _use_runtime_files():
         from mm_common import invoke
         try:
+            prefix = f"{_WORKSPACE_PREFIX}/{session_id}"
             cmd = (
-                f'find {_WORKSPACE_PREFIX}/{session_id} -type f '
-                f'-printf "%s\\t%P\\n" 2>/dev/null'
+                f"/bin/bash -c 'find {prefix} -type f -exec ls -l {{}} + 2>/dev/null"
+                " | awk \"{print \\$5, \\$NF}\"'"
             )
             stdout, _, exit_code = invoke.runtime_command(AGENT_ARN, session_id, cmd)
             if exit_code != 0 or not stdout.strip():
                 return JSONResponse({"session_id": session_id, "tree": []})
-            tree = _parse_find_output(stdout)
+            tree = _parse_ls_output(stdout, prefix)
             return JSONResponse({"session_id": session_id, "tree": tree})
         except Exception as e:
             logger.warning("[portal] runtime_command list_files failed: %s", e)
@@ -559,13 +560,24 @@ async def list_session_files(session_id: str, _: None = Depends(_require_auth)) 
         return JSONResponse({"session_id": session_id, "tree": tree})
 
 
-def _parse_find_output(stdout: str) -> list[dict]:
-    """Parse `find -printf '%s\\t%P\\n'` output into a nested tree structure."""
+def _parse_ls_output(stdout: str, prefix: str) -> list[dict]:
+    """Parse `ls -l | awk '{print $5, $NF}'` output into a nested tree structure.
+
+    Each line is: "<size> <absolute_path>". We strip the prefix to get rel_path.
+    """
     files: list[tuple[int, str]] = []
+    prefix_slash = prefix.rstrip("/") + "/"
     for line in stdout.strip().splitlines():
-        parts = line.split("\t", 1)
-        if len(parts) == 2:
-            size, rel_path = int(parts[0]), parts[1]
+        parts = line.split(" ", 1)
+        if len(parts) != 2:
+            continue
+        try:
+            size = int(parts[0])
+        except ValueError:
+            continue
+        abs_path = parts[1]
+        rel_path = abs_path[len(prefix_slash):] if abs_path.startswith(prefix_slash) else abs_path
+        if rel_path:
             files.append((size, rel_path))
 
     root: list[dict] = []
@@ -573,7 +585,6 @@ def _parse_find_output(stdout: str) -> list[dict]:
 
     for size, rel_path in sorted(files, key=lambda x: x[1]):
         segments = rel_path.split("/")
-        # Ensure parent directories exist in tree
         for i in range(1, len(segments)):
             dir_path = "/".join(segments[:i])
             parent_path = "/".join(segments[:i-1])
@@ -586,7 +597,6 @@ def _parse_find_output(stdout: str) -> list[dict]:
                 }
                 dirs_map[dir_path] = dir_node["children"]
                 dirs_map.setdefault(parent_path, root).append(dir_node)
-        # Add file node
         parent_path = "/".join(segments[:-1])
         dirs_map.setdefault(parent_path, root).append({
             "name": segments[-1],
@@ -611,7 +621,7 @@ async def download_session_file(session_id: str, file_path: str, _: None = Depen
         full_remote = f"{_WORKSPACE_PREFIX}/{session_id}/{file_path}"
         try:
             # Use base64 encoding for safe binary transfer
-            cmd = f'base64 "{full_remote}" 2>/dev/null'
+            cmd = f"/bin/bash -c 'base64 \"{full_remote}\" 2>/dev/null'"
             stdout, _, exit_code = invoke.runtime_command(AGENT_ARN, session_id, cmd, timeout=30)
             if exit_code != 0 or not stdout.strip():
                 raise HTTPException(status_code=404, detail=f"file not found: {file_path}")
