@@ -4,7 +4,6 @@
 @source "../lib";
 @source "../hooks";
 @source "../app";
-@import "katex/dist/katex.min.css";
 
 /* include utility classes in streamdown */
 /* This is required for the MessageResponse component to work properly */

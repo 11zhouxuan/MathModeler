@@ -4,6 +4,7 @@ import { Geist, Geist_Mono } from 'next/font/google';
 import { ThemeProvider } from '@/components/theme-provider';
 import { AuthProvider } from '@/lib/auth';
 
+import 'katex/dist/katex.min.css';
 import './globals.css';
 
 

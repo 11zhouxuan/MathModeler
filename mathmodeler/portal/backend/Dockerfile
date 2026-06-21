@@ -10,6 +10,10 @@ WORKDIR /fe
 COPY portal/frontend/package.json portal/frontend/package-lock.json* ./
 RUN npm install
 COPY portal/frontend/ ./
+# Turbopack (Next.js 16 default bundler) skips PostCSS on ARM64 Docker.
+# Pre-compile Tailwind v4 CSS via the CLI so the build receives plain CSS.
+RUN npx @tailwindcss/cli@4 -i app/globals.css -o app/globals.compiled.css --minify \
+    && mv app/globals.compiled.css app/globals.css
 RUN npm run build   # -> /fe/out
 
 # --- stage 2: python runtime (FastAPI on uvicorn) -------------------------
