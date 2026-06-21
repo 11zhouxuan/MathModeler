@@ -313,6 +313,7 @@ def _iter_chat_stream(body: dict):
             accumulated_frames.append(raw)
             yield f"data: {raw}\n\n"
     except Exception as e:  # noqa: BLE001
+        logger.error("[portal] stream error session=%s: %s", sid, e, exc_info=True)
         yield _sdk_frame({"type": "error", "errorText": str(e)})
     finally:
         yield "data: [DONE]\n\n"
