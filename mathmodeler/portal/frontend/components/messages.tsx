@@ -61,6 +61,19 @@ function PureMessages({
               <ThinkingMessage />
             )}
 
+          {status === 'streaming' &&
+            messages.length > 0 &&
+            (() => {
+              const last = messages[messages.length - 1];
+              if (last.role !== 'assistant') return true;
+              const hasVisibleContent = (last.parts || []).some(
+                (p: any) => (p.type === 'text' && p.text?.trim()) || p.type === 'tool-invocation'
+              );
+              return !hasVisibleContent;
+            })() && (
+              <ThinkingMessage />
+            )}
+
           <div
             className="min-h-[24px] min-w-[24px] shrink-0"
             ref={messagesEndRef}
