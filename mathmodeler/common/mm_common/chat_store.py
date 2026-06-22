@@ -73,16 +73,21 @@ def save_session(
     try:
         table = _ddb()
 
-        # 1. Upsert session metadata
-        table.put_item(Item={
-            "PK": "SESSION",
-            "SK": session_id,
-            "title": derived_title,
-            "problem": (problem or "")[:500],
-            "created_at": now,
-            "updated_at": now,
-            "msg_count": len(messages),
-        })
+        # 1. Upsert session metadata — only set title on first creation
+        table.update_item(
+            Key={"PK": "SESSION", "SK": session_id},
+            UpdateExpression="SET updated_at = :ts, msg_count = :mc"
+                            ", #t = if_not_exists(#t, :title)"
+                            ", problem = if_not_exists(problem, :prob)"
+                            ", created_at = if_not_exists(created_at, :ts)",
+            ExpressionAttributeNames={"#t": "title"},
+            ExpressionAttributeValues={
+                ":ts": now,
+                ":mc": len(messages),
+                ":title": derived_title,
+                ":prob": (problem or "")[:500],
+            },
+        )
 
         # 2. Write messages in batches of 25 (DynamoDB batch limit)
         with table.batch_writer() as batch:
