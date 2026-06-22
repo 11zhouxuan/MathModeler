@@ -49,11 +49,14 @@ def make_app(handler: Handler, stream_handler: StreamHandler | None = None) -> F
     app = FastAPI(title="MathModeler Agent", version="0.1.0")
 
     @app.get("/ping")
-    def ping() -> dict:
+    def ping(req: Request) -> dict:
         import time
-        if _is_busy:
-            return {"status": "HealthyBusy", "time_of_last_update": int(time.time())}
-        return {"status": "healthy", "time_of_last_update": int(time.time())}
+        now = time.time()
+        client = req.client.host if req.client else "unknown"
+        status = "HealthyBusy" if _is_busy else "healthy"
+        ts = int(now)
+        logger.info("[ping] from=%s status=%s time_of_last_update=%d", client, status, ts)
+        return {"status": status, "time_of_last_update": ts}
 
     @app.post("/invocations")
     async def invocations(req: Request):

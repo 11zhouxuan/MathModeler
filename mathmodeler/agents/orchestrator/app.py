@@ -210,7 +210,9 @@ async def stream_supervisor(body: dict):
         if saved and saved.get("completed"):
             logger.info("[orchestrator] CONTINUE session=%s (restoring %d completed tasks)",
                         session_id, len(saved["completed"]))
-            sup.restore(saved)
+            # Only restore _completed cache, not interrupt state.
+            # Interrupt state would force Strands to expect interruptResponses.
+            sup._completed.update(saved.get("completed", {}))
             # Inject system reminder about disconnect recovery into the task
             completed_keys = list(saved["completed"].keys())
             completed_info = ", ".join(
