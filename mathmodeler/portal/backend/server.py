@@ -526,37 +526,50 @@ async def delete_session_route(session_id: str, _: None = Depends(_require_auth)
 
 
 # --- workspace file browser API (session files) ----------------------------
-# In deployed mode (AGENT_CORE_ARN set), files live inside the AgentCore Runtime
-# container's managed session storage (/mnt/workspace/jobs/{session_id}/).
-# Portal fetches them via InvokeAgentRuntimeCommand (shell commands in the same
-# runtime session). In local dev, falls back to reading from the local filesystem.
+# In deployed mode (AGENT_CORE_ARN set), files are persisted to S3 under the
+# key prefix ``jobs/{session_id}/``. Portal reads directly from S3 (no need
+# to invoke the runtime). In local dev (no AGENT_CORE_ARN), falls back to
+# reading from the local filesystem.
 
-_WORKSPACE_PREFIX = "/mnt/workspace/jobs"
+DOC_BUCKET = os.environ.get("DOC_BUCKET", "")
+
+_s3_file_client = None
 
 
-def _use_runtime_files() -> bool:
-    """True when we should fetch files from the runtime (deployed mode)."""
-    return bool(AGENT_ARN)
+def _get_s3_file_client():
+    """Lazy-init boto3 S3 client for the file browser API."""
+    global _s3_file_client
+    if _s3_file_client is None:
+        import boto3
+        region = os.environ.get("AWS_REGION", "us-west-2")
+        _s3_file_client = boto3.client("s3", region_name=region)
+    return _s3_file_client
+
+
+def _use_s3_files() -> bool:
+    """True when we should read files from S3 (deployed mode with bucket)."""
+    return bool(AGENT_ARN and DOC_BUCKET)
 
 
 @app.get("/api/files/{session_id}")
 async def list_session_files(session_id: str, _: None = Depends(_require_auth)) -> JSONResponse:
     """List all files in a session workspace as a tree structure."""
-    if _use_runtime_files():
-        from mm_common import invoke
+    if _use_s3_files():
         try:
-            prefix = f"{_WORKSPACE_PREFIX}/{session_id}"
-            cmd = (
-                f"/bin/bash -c 'find {prefix} -type f -exec ls -l {{}} + 2>/dev/null"
-                " | awk \"{print \\$5, \\$NF}\"'"
-            )
-            stdout, _, exit_code = invoke.runtime_command(AGENT_ARN, session_id, cmd)
-            if exit_code != 0 or not stdout.strip():
-                return JSONResponse({"session_id": session_id, "tree": []})
-            tree = _parse_ls_output(stdout, prefix)
+            prefix = f"jobs/{session_id}/"
+            client = _get_s3_file_client()
+            paginator = client.get_paginator("list_objects_v2")
+            files: list[tuple[int, str]] = []
+            for page in paginator.paginate(Bucket=DOC_BUCKET, Prefix=prefix):
+                for obj in page.get("Contents", []):
+                    key = obj["Key"]
+                    rel = key[len(prefix):]
+                    if rel:
+                        files.append((obj.get("Size", 0), rel))
+            tree = _build_tree_from_files(files)
             return JSONResponse({"session_id": session_id, "tree": tree})
         except Exception as e:
-            logger.warning("[portal] runtime_command list_files failed: %s", e)
+            logger.warning("[portal] S3 list_files failed: %s", e)
             return JSONResponse({"session_id": session_id, "tree": []})
     else:
         from mm_common import workspace
@@ -564,26 +577,8 @@ async def list_session_files(session_id: str, _: None = Depends(_require_auth)) 
         return JSONResponse({"session_id": session_id, "tree": tree})
 
 
-def _parse_ls_output(stdout: str, prefix: str) -> list[dict]:
-    """Parse `ls -l | awk '{print $5, $NF}'` output into a nested tree structure.
-
-    Each line is: "<size> <absolute_path>". We strip the prefix to get rel_path.
-    """
-    files: list[tuple[int, str]] = []
-    prefix_slash = prefix.rstrip("/") + "/"
-    for line in stdout.strip().splitlines():
-        parts = line.split(" ", 1)
-        if len(parts) != 2:
-            continue
-        try:
-            size = int(parts[0])
-        except ValueError:
-            continue
-        abs_path = parts[1]
-        rel_path = abs_path[len(prefix_slash):] if abs_path.startswith(prefix_slash) else abs_path
-        if rel_path:
-            files.append((size, rel_path))
-
+def _build_tree_from_files(files: list[tuple[int, str]]) -> list[dict]:
+    """Build a nested tree structure from a flat list of (size, rel_path) tuples."""
     root: list[dict] = []
     dirs_map: dict[str, list[dict]] = {"": root}
 
@@ -614,27 +609,26 @@ def _parse_ls_output(stdout: str, prefix: str) -> list[dict]:
 @app.get("/api/files/{session_id}/{file_path:path}")
 async def download_session_file(session_id: str, file_path: str, _: None = Depends(_require_auth)):
     """Download a specific file from the session workspace."""
-    if _use_runtime_files():
-        from mm_common import invoke
+    # Security: reject path traversal
+    if ".." in file_path:
+        raise HTTPException(status_code=403, detail="path traversal denied")
+
+    if _use_s3_files():
         from fastapi.responses import Response
 
-        # Security: reject path traversal
-        if ".." in file_path:
-            raise HTTPException(status_code=403, detail="path traversal denied")
-
-        full_remote = f"{_WORKSPACE_PREFIX}/{session_id}/{file_path}"
+        key = f"jobs/{session_id}/{file_path}"
         try:
-            # Use base64 encoding for safe binary transfer
-            cmd = f"/bin/bash -c 'base64 \"{full_remote}\" 2>/dev/null'"
-            stdout, _, exit_code = invoke.runtime_command(AGENT_ARN, session_id, cmd, timeout=30)
-            if exit_code != 0 or not stdout.strip():
-                raise HTTPException(status_code=404, detail=f"file not found: {file_path}")
-            data = base64.b64decode(stdout.strip())
-        except HTTPException:
-            raise
+            resp = _get_s3_file_client().get_object(Bucket=DOC_BUCKET, Key=key)
+            data = resp["Body"].read()
+        except _get_s3_file_client().exceptions.NoSuchKey:
+            raise HTTPException(status_code=404, detail=f"file not found: {file_path}")
         except Exception as e:
-            logger.warning("[portal] runtime_command download failed: %s", e)
-            raise HTTPException(status_code=502, detail="runtime unavailable")
+            # ClientError with 404 code (key not found)
+            error_code = getattr(getattr(e, "response", {}), "get", lambda *a: None)
+            if hasattr(e, "response") and e.response.get("Error", {}).get("Code") == "NoSuchKey":
+                raise HTTPException(status_code=404, detail=f"file not found: {file_path}")
+            logger.warning("[portal] S3 download failed key=%s: %s", key, e)
+            raise HTTPException(status_code=502, detail="S3 unavailable")
 
         filename = file_path.rsplit("/", 1)[-1]
         ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
