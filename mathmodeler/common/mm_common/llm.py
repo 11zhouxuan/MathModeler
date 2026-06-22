@@ -38,6 +38,9 @@ def make_model(temperature: float = 0.0, max_tokens: int = 16384):
         region_name=config.REGION,
         max_tokens=max_tokens,
         boto_client_config=boto_config,
+        additional_request_fields={
+            "thinking": {"type": "disabled"},
+        },
     )
 
 
@@ -45,7 +48,7 @@ def make_model(temperature: float = 0.0, max_tokens: int = 16384):
 def make_session_manager(session_id: str, agent_name: str):
     """Create an AgentCoreMemorySessionManager for persisting agent chat history.
 
-    Each agent gets its own memory session: "{session_id}/{agent_name}".
+    Each agent gets its own memory session: "{session_id}_{agent_name}".
     Returns None if MEMORY_ID is not configured (local dev).
     """
     if not config.MEMORY_ID:

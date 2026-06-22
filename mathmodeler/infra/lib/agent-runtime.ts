@@ -97,7 +97,7 @@ export class AgentRuntime extends Construct {
         AWS_REGION: 'us-west-2',
         // Claude Opus requires a cross-region inference profile (on-demand
         // foundation-model id is rejected by ConverseStream).
-        MODEL_ID: 'us.anthropic.claude-opus-4-8',
+        MODEL_ID: 'us.anthropic.claude-opus-4-6-v1',
         DOC_BUCKET: props.bucket.bucketName,
 
         MEMORY_ID: props.memory.memoryId,

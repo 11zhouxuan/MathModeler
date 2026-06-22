@@ -13,7 +13,7 @@ import os
 # Claude Opus must be invoked via a cross-region inference profile (the bare
 # on-demand foundation-model id is NOT supported for ConverseStream), so the
 # default uses the ``us.`` inference-profile id.
-_DEFAULT_MODEL_ID = "us.anthropic.claude-opus-4-8"
+_DEFAULT_MODEL_ID = "us.anthropic.claude-opus-4-6-v1"
 
 
 # Nova Multimodal Embeddings is only available in us-east-1 -> cross-region call.
