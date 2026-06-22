@@ -36,7 +36,9 @@ import time
 import uuid
 from pathlib import Path
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("mm.portal")
+logger.setLevel(logging.INFO)
 
 
 
