@@ -226,8 +226,7 @@ def _analyst_extract(session_id: str) -> dict:
 def build_analyst_agent(session_id: str):
     """Construct the Analyst Strands Agent (streaming-ready, for the Supervisor)."""
     logger.info("[runners] build_analyst_agent session=%s", session_id)
-    sm = llm.make_session_manager(session_id, "analyst")
-    return llm.build_agent(ANALYST_SYSTEM, analyst_tools(session_id) + BUILTIN_TOOLS, session_manager=sm)
+    return llm.build_agent(ANALYST_SYSTEM, analyst_tools(session_id) + BUILTIN_TOOLS)
 
 
 
@@ -274,8 +273,7 @@ def _modeler_extract(session_id: str, task_id: str) -> dict:
 def build_modeler_agent(session_id: str):
     """Construct the Modeler Strands Agent (streaming-ready, for the Supervisor)."""
     logger.info("[runners] build_modeler_agent session=%s (loading HMML retriever…)", session_id)
-    sm = llm.make_session_manager(session_id, "modeler")
-    agent = llm.build_agent(_MODELER_SYSTEM, modeler_tools(session_id, get_retriever()) + BUILTIN_TOOLS, session_manager=sm)
+    agent = llm.build_agent(_MODELER_SYSTEM, modeler_tools(session_id, get_retriever()) + BUILTIN_TOOLS)
     logger.info("[runners] build_modeler_agent ready session=%s", session_id)
     return agent
 
@@ -537,8 +535,7 @@ def build_solver_agent(session_id: str, ci=None):
             logger.exception("[runners] Code Interpreter FAILED to start session=%s "
                              "(solver code execution will not work locally)", session_id)
             raise
-    sm = llm.make_session_manager(session_id, "solver")
-    agent = llm.build_agent(SOLVER_SYSTEM, solver_tools(session_id, ci) + BUILTIN_TOOLS, session_manager=sm)
+    agent = llm.build_agent(SOLVER_SYSTEM, solver_tools(session_id, ci) + BUILTIN_TOOLS)
     agent._ci = ci  # type: ignore[attr-defined]
     return agent
 
@@ -593,8 +590,7 @@ def _reporter_extract(session_id: str) -> dict:
 
 def build_reporter_agent(session_id: str):
     """Construct the Reporter Strands Agent (streaming-ready, for the Supervisor)."""
-    sm = llm.make_session_manager(session_id, "reporter")
-    return llm.build_agent(REPORTER_SYSTEM, reporter_tools(session_id) + BUILTIN_TOOLS, session_manager=sm)
+    return llm.build_agent(REPORTER_SYSTEM, reporter_tools(session_id) + BUILTIN_TOOLS)
 
 
 def run_reporter(body: dict) -> dict:

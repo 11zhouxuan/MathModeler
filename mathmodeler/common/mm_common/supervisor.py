@@ -36,18 +36,14 @@ from typing import Any, Awaitable, Callable
 logger = logging.getLogger("mm.supervisor")
 
 
-def _completion_key(name: str, subtask: Any) -> str:
-    """Re-entrancy cache key scoped to (sub-agent name, subtask).
+def _completion_key(name: str, task_id: str) -> str:
+    """Re-entrancy cache key scoped to (sub-agent name, task_id).
 
-    The cache exists to avoid RE-RUNNING an interrupted ``run_subagent`` call
-    from the top on HITL resume (Strands re-invokes the tool). It must be keyed
-    by BOTH the sub-agent name AND its subtask: the supervisor legitimately
-    calls the SAME sub-agent (e.g. ``modeler``) many times with DIFFERENT
-    subtasks (T1, T2, …). Keying by name alone made every later call short-
-    circuit to the first task's cached result (cross-task contamination).
+    Uses the deterministic task_id (T1, T2, T3...) from the DAG rather than
+    a hash of the subtask text. This ensures cache hits even when the supervisor
+    regenerates slightly different subtask descriptions on reconnect.
     """
-    h = hashlib.sha1(str(subtask or "").encode("utf-8")).hexdigest()[:16]
-    return f"{name}\x1f{h}"
+    return f"{name}\x1f{task_id}"
 
 
 
@@ -213,6 +209,31 @@ class Supervisor:
         completed = self._completed
         supervisor = self.supervisor
         _sup_self = self
+        _session_id = self.session_id
+
+        def _load_subagent_messages(sub, name: str, task_id: str) -> None:
+            """Load sub-agent messages from AgentCore Memory for this specific task."""
+            try:
+                from mm_common.llm import make_session_manager
+                mem_session = f"{_session_id}_{name}_{task_id}" if task_id else f"{_session_id}_{name}"
+                sm = make_session_manager(_session_id, f"{name}_{task_id}" if task_id else name)
+                if sm is None:
+                    return
+                sm.initialize(sub)
+            except Exception:  # noqa: BLE001
+                pass
+
+        def _save_subagent_messages(sub, name: str, task_id: str) -> None:
+            """Save sub-agent messages to AgentCore Memory after task completion."""
+            try:
+                from mm_common.llm import make_session_manager
+                sm = make_session_manager(_session_id, f"{name}_{task_id}" if task_id else name)
+                if sm is None:
+                    return
+                # Manually save each message and sync state
+                sm.sync_agent(sub)
+            except Exception:  # noqa: BLE001
+                pass
 
 
         async def _drive(sub, name, prompt):
@@ -298,13 +319,14 @@ class Supervisor:
 
 
         @tool(context=True)
-        async def run_subagent(tool_context, description: str, name: str, subtask: str):
+        async def run_subagent(tool_context, description: str, name: str, subtask: str, task_id: str = ""):
             """Delegate ``subtask`` to the named sub-agent and return its result.
 
             Args:
                 description: ≤10字中文动作摘要（展示给用户，如"分析问题结构"）。
                 name: Sub-agent name (analyst/modeler/solver/reporter).
                 subtask: The task instruction to pass to the sub-agent.
+                task_id: Deterministic task identifier from the DAG (T0/T1/T2/T3/TR).
 
             The sub-agent runs to completion (its progress streams live); if it calls
             ``ask_user`` the whole chain pauses for user input and resumes later.
@@ -319,10 +341,12 @@ class Supervisor:
             # not re-hit the model / redo S3 side effects. Keyed by (name, subtask)
             # so the SAME sub-agent invoked for DIFFERENT subtasks (T1, T2, …) is
             # NOT short-circuited to an earlier task's result.
-            ckey = _completion_key(name, subtask)
+            # Use task_id for deterministic keying; fall back to name if not provided.
+            effective_id = task_id or name
+            ckey = _completion_key(name, effective_id)
             if ckey in completed:
-                logger.info("[supervisor] run_subagent(%r): cache hit (skip re-run) subtask=%s",
-                            name, _short(subtask or ""))
+                logger.info("[supervisor] run_subagent(%r): cache hit (skip re-run) task_id=%s",
+                            name, effective_id)
                 yield {"node": name, "result_text": completed[ckey]}
                 yield {"status": "success", "content": [{"text": completed[ckey]}]}
                 return
@@ -336,14 +360,12 @@ class Supervisor:
                 return
 
             # Four-stage progress marker (start) — surfaced as data-stage downstream.
-            logger.info("[supervisor] subagent %r START", name)
+            logger.info("[supervisor] subagent %r START task_id=%s", name, effective_id)
             yield {"node": name, "stage_status": "start"}
 
-            # LANGUAGE: handled purely via prompts. SUPERVISOR_SYSTEM instructs the
-            # supervisor to write subtask instructions in the user's language, and
-            # LANGUAGE_PREAMBLE + LANGUAGE_DIRECTIVE (prepended/appended to every
-            # agent's system prompt) enforce that each agent outputs in the same
-            # language as the user's problem. No code-side detection/rewrite here.
+            # Load sub-agent conversation history from Memory (enables resume after disconnect).
+            _load_subagent_messages(sub, name, effective_id)
+
             gen = _drive(sub, name, subtask)
 
             async for ev in gen:
@@ -371,7 +393,9 @@ class Supervisor:
             text = _extract_text(r)
             completed[ckey] = text
             logger.info("[supervisor] subagent %r DONE (result %d chars)", name, len(text))
-            # Persist after each sub-agent completes so progress survives disconnects.
+            # Save sub-agent messages to Memory for future resume.
+            _save_subagent_messages(sub, name, effective_id)
+            # Persist supervisor state so progress survives disconnects.
             _sup_self._persist()
 
             yield {"node": name, "result_text": text}

@@ -207,9 +207,28 @@ async def stream_supervisor(body: dict):
             logger.info("[orchestrator] CONTINUE session=%s (restoring %d completed tasks)",
                         session_id, len(saved["completed"]))
             sup.restore(saved)
-        task = _build_task(body)
-        logger.info("[orchestrator] START session=%s (task %d chars)", session_id, len(task))
-        gen = sup.stream(task=task)
+            # Inject system reminder about disconnect recovery into the task
+            completed_keys = list(saved["completed"].keys())
+            completed_info = ", ".join(
+                k.replace("\x1f", "/") for k in completed_keys
+            )
+            problem = body.get("problem", "")
+            task_text = (
+                f"session_id={session_id}\n\n"
+                f"<system-reminder>\n"
+                f"这是一个中断恢复的 session。以下子任务已完成（无需重复执行）：{completed_info}。\n"
+                f"请检查你的对话历史，确认当前进度，从上次中断的位置继续执行。\n"
+                f"如果上一次 run_subagent 调用因中断未返回结果，请重新执行该调用。\n"
+                f"</system-reminder>\n\n"
+                f"<user_problem>\n{problem}\n</user_problem>"
+            )
+            logger.info("[orchestrator] START session=%s (task %d chars, resume mode)",
+                        session_id, len(task_text))
+            gen = sup.stream(task=task_text)
+        else:
+            task = _build_task(body)
+            logger.info("[orchestrator] START session=%s (task %d chars)", session_id, len(task))
+            gen = sup.stream(task=task)
 
     try:
         async for frame in tx.run(gen):
