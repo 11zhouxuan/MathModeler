@@ -236,7 +236,12 @@ async def stream_supervisor(body: dict):
     try:
         async for frame in tx.run(gen):
             yield frame
+    except (GeneratorExit, asyncio.CancelledError) as e:
+        logger.info("[orchestrator] stream DISCONNECTED (client gone) session=%s: %s", session_id, e, exc_info=True)
+    except Exception as e:
+        logger.info("[orchestrator] stream_supervisor error session=%s: %s", session_id, e, exc_info=True)
     finally:
+        logger.info("[orchestrator] stream_supervisor ENDED session=%s", session_id)
         _RUNNING.pop(session_id, None)
         # Best-effort: stop any Solver Code Interpreter session opened for this run.
         _teardown_subagents(sup)
