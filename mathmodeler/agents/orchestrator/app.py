@@ -57,6 +57,9 @@ def _configure_mm_logging() -> None:
 _configure_mm_logging()
 logger = logging.getLogger("mm.orchestrator")
 
+# Start the S3 workspace watcher thread (polls every 2s for new/modified files).
+workspace.start_s3_watcher()
+
 
 from mm_common.llm import build_agent
 from mm_common.prompts import SUPERVISOR_SYSTEM

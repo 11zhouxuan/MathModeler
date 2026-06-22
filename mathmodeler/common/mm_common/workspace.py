@@ -34,7 +34,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import queue
 import threading
 from pathlib import Path
 
@@ -52,12 +51,11 @@ def _ensure_root() -> None:
 
 
 # ---------------------------------------------------------------------------
-# S3 Sync — background thread for non-blocking uploads + restore on init
+# S3 Sync — polling watcher thread that monitors workspace for changes
 # ---------------------------------------------------------------------------
 _s3_client = None
-_s3_queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
-_s3_thread: threading.Thread | None = None
-_s3_started = False
+_s3_watcher_started = False
+_s3_file_state: dict[str, float] = {}  # {absolute_path: mtime}
 
 
 def _s3_enabled() -> bool:
@@ -81,47 +79,61 @@ def _s3_key(session_id: str, rel: str) -> str:
     return f"jobs/{session_id}/{rel}"
 
 
-def _s3_upload_worker() -> None:
-    """Background thread: drain the queue and upload files to S3."""
+def _s3_watcher() -> None:
+    """Background thread: poll workspace root every 2s, upload new/modified files."""
+    import time as _time
+    from . import config
+
     while True:
-        item = _s3_queue.get()
-        if item is None:
-            # Poison pill — shutdown signal
-            break
-        session_id, rel = item
+        _time.sleep(2)
         try:
-            from . import config
-            path = session_path(session_id) / rel
-            if not path.exists():
+            if not WORKSPACE_ROOT.exists():
                 continue
-            key = _s3_key(session_id, rel)
-            data = path.read_bytes()
-            _get_s3_client().put_object(
-                Bucket=config.DOC_BUCKET,
-                Key=key,
-                Body=data,
-            )
-            logger.debug("[workspace:s3] uploaded %s (%d bytes)", key, len(data))
-        except Exception as e:  # noqa: BLE001
-            logger.warning("[workspace:s3] upload failed %s/%s: %s", session_id, rel, e)
+            # Scan all session directories
+            for session_dir in WORKSPACE_ROOT.iterdir():
+                if not session_dir.is_dir():
+                    continue
+                session_id = session_dir.name
+                # Walk all files in the session
+                for file_path in session_dir.rglob("*"):
+                    if not file_path.is_file():
+                        continue
+                    abs_str = str(file_path)
+                    try:
+                        mtime = file_path.stat().st_mtime
+                    except OSError:
+                        continue
+                    # Check if new or modified
+                    prev_mtime = _s3_file_state.get(abs_str)
+                    if prev_mtime is not None and prev_mtime >= mtime:
+                        continue
+                    # Upload to S3
+                    rel = str(file_path.relative_to(session_dir))
+                    key = _s3_key(session_id, rel)
+                    try:
+                        data = file_path.read_bytes()
+                        _get_s3_client().put_object(
+                            Bucket=config.DOC_BUCKET,
+                            Key=key,
+                            Body=data,
+                        )
+                        _s3_file_state[abs_str] = mtime
+                        logger.info("[workspace:s3] synced %s (%d bytes)", key, len(data))
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("[workspace:s3] upload failed %s: %s", key, e)
+        except Exception:  # noqa: BLE001
+            pass
 
 
-def _ensure_s3_thread() -> None:
-    """Start the background upload thread (once)."""
-    global _s3_thread, _s3_started
-    if _s3_started:
+def start_s3_watcher() -> None:
+    """Start the S3 polling watcher thread (call once at server startup)."""
+    global _s3_watcher_started
+    if _s3_watcher_started or not _s3_enabled():
         return
-    _s3_started = True
-    _s3_thread = threading.Thread(target=_s3_upload_worker, daemon=True, name="ws-s3-sync")
-    _s3_thread.start()
-
-
-def _enqueue_upload(session_id: str, rel: str) -> None:
-    """Queue a file for async S3 upload (non-blocking)."""
-    if not _s3_enabled():
-        return
-    _ensure_s3_thread()
-    _s3_queue.put((session_id, rel))
+    _s3_watcher_started = True
+    t = threading.Thread(target=_s3_watcher, daemon=True, name="ws-s3-watcher")
+    t.start()
+    logger.info("[workspace:s3] watcher thread started (polling every 2s)")
 
 
 def _s3_restore(session_id: str) -> None:
@@ -148,11 +160,12 @@ def _s3_restore(session_id: str) -> None:
                     continue
                 local_path = base / rel
                 if local_path.exists():
-                    # Local file already present — don't overwrite
                     continue
                 local_path.parent.mkdir(parents=True, exist_ok=True)
                 resp = client.get_object(Bucket=config.DOC_BUCKET, Key=key)
                 local_path.write_bytes(resp["Body"].read())
+                # Track mtime so watcher doesn't re-upload restored files
+                _s3_file_state[str(local_path)] = local_path.stat().st_mtime
                 restored += 1
         if restored:
             logger.info("[workspace:s3] restored %d files for session %s", restored, session_id)
@@ -195,7 +208,7 @@ def write_text(session_id: str, rel: str, text: str) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     logger.info("[workspace] write_text %s/%s (%d bytes)", session_id, rel, len(text))
-    _enqueue_upload(session_id, rel)
+
     return str(path)
 
 
@@ -228,7 +241,7 @@ def write_bytes(session_id: str, rel: str, data: bytes) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
     logger.info("[workspace] write_bytes %s/%s (%d bytes)", session_id, rel, len(data))
-    _enqueue_upload(session_id, rel)
+
     return str(path)
 
 
@@ -320,5 +333,5 @@ def append_text(session_id: str, rel: str, text: str) -> str:
     with open(path, "a", encoding="utf-8") as f:
         f.write(text)
     logger.info("[workspace] append_text %s/%s (+%d bytes)", session_id, rel, len(text))
-    _enqueue_upload(session_id, rel)
+
     return str(path)
