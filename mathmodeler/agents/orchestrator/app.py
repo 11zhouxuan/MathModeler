@@ -71,7 +71,7 @@ from mm_common.runners import (
     build_reporter_agent,
     build_solver_agent,
 )
-from mm_common.server import make_app
+from mm_common.server import make_app, set_busy
 from mm_common.state_store import MemoryStateStore, S3StateStore
 from mm_common.streaming import StrandsToAISDK
 from mm_common.supervisor import Supervisor
@@ -193,6 +193,7 @@ async def stream_supervisor(body: dict):
 
     sup = build_supervisor(session_id)
     _RUNNING[session_id] = sup
+    set_busy(True)
     tx = StrandsToAISDK()
 
     interrupt_responses = body.get("interruptResponses")
@@ -241,6 +242,7 @@ async def stream_supervisor(body: dict):
     except Exception as e:
         logger.info("[orchestrator] stream_supervisor error session=%s: %s", session_id, e, exc_info=True)
     finally:
+        set_busy(False)
         logger.info("[orchestrator] stream_supervisor ENDED session=%s", session_id)
         _RUNNING.pop(session_id, None)
         # Best-effort: stop any Solver Code Interpreter session opened for this run.

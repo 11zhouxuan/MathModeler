@@ -25,12 +25,35 @@ StreamHandler = Callable[[dict], Iterable[str] | Awaitable[Any]]
 
 
 
+_last_activity: float = 0.0
+_is_busy: bool = False
+
+
+def set_busy(busy: bool) -> None:
+    """Mark the server as busy (streaming in progress)."""
+    global _is_busy, _last_activity
+    _is_busy = busy
+    if busy:
+        import time
+        _last_activity = time.time()
+
+
+def touch_activity() -> None:
+    """Update last activity timestamp (call during streaming)."""
+    global _last_activity
+    import time
+    _last_activity = time.time()
+
+
 def make_app(handler: Handler, stream_handler: StreamHandler | None = None) -> FastAPI:
     app = FastAPI(title="MathModeler Agent", version="0.1.0")
 
     @app.get("/ping")
     def ping() -> dict:
-        return {"status": "healthy"}
+        import time
+        if _is_busy:
+            return {"status": "HealthyBusy", "time_of_last_update": int(time.time())}
+        return {"status": "healthy", "time_of_last_update": int(time.time())}
 
     @app.post("/invocations")
     async def invocations(req: Request):
