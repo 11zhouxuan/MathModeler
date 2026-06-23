@@ -22,7 +22,11 @@ def _get_client():
         _client = boto3.client(
             "bedrock-agentcore",
             region_name=config.REGION,
-            config=Config(read_timeout=600, connect_timeout=10),
+            config=Config(
+                read_timeout=600,
+                connect_timeout=10,
+                tcp_keepalive=True,
+            ),
         )
     return _client
 
