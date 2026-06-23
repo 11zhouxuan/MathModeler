@@ -107,11 +107,15 @@ export class AgentRuntime extends Construct {
       },
     });
 
-    // Escape hatch: L2 construct doesn't expose filesystemConfigurations yet.
+    // Escape hatch: L2 construct doesn't expose these yet.
     const cfnRuntime = runtime.node.defaultChild as CfnRuntime;
     cfnRuntime.addPropertyOverride('FilesystemConfigurations', [
       { SessionStorage: { MountPath: '/mnt/workspace' } },
     ]);
+    cfnRuntime.addPropertyOverride('LifecycleConfiguration', {
+      IdleRuntimeSessionTimeout: 28800,
+      MaxLifetime: 28800,
+    });
 
     this.arn = runtime.agentRuntimeArn;
   }
