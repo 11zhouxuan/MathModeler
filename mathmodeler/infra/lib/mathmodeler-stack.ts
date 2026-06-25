@@ -29,10 +29,12 @@ export class MathModelerStack extends Stack {
     super(scope, id, props);
 
     // --- S3 document bus (§7.4) ---
+    // Note: versioning is enforced by S3 Files (cannot be toggled once attached).
+    // Do NOT set versioned:true here — it would trigger a no-op update that S3
+    // rejects with "versioning state cannot be changed".
     const bucket = new s3.Bucket(this, 'DocBus', {
       removalPolicy: RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
-      versioned: true,  // Required by S3 Files
       encryption: s3.BucketEncryption.S3_MANAGED,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
     });

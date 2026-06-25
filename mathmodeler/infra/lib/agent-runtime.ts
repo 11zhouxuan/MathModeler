@@ -96,7 +96,10 @@ export class AgentRuntime extends Construct {
     // S3 Files service permissions (when using S3 Files mount).
     if (props.s3FilesAccessPointArn) {
       this.role.addToPolicy(new iam.PolicyStatement({
-        actions: ['s3files:GetAccessPoint', 's3files:GetFileSystem', 's3files:GetMountTarget'],
+        actions: [
+          's3files:GetAccessPoint', 's3files:GetFileSystem',
+          's3files:GetMountTarget', 's3files:ListMountTargets',
+        ],
         resources: ['*'],
       }));
     }
