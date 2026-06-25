@@ -93,8 +93,10 @@ export class MathModelerStack extends Stack {
     });
 
     // Mount targets — one per public subnet (max 3 to stay within limits).
+    // Mount targets take 1-3 minutes to become available; the Runtime must
+    // wait for them via an explicit dependency.
     const subnets = vpc.publicSubnets.slice(0, 3);
-    subnets.forEach((subnet, i) =>
+    const mountTargets = subnets.map((subnet, i) =>
       new s3files.CfnMountTarget(this, `MountTarget${i}`, {
         fileSystemId: fileSystem.attrFileSystemId,
         subnetId: subnet.subnetId,
@@ -111,6 +113,8 @@ export class MathModelerStack extends Stack {
         creationPermissions: { ownerGid: '0', ownerUid: '0', permissions: '755' },
       },
     });
+    // Access point depends on mount targets being ready
+    mountTargets.forEach(mt => accessPoint.addDependency(mt));
 
     // --- Single merged Runtime (agents-as-tools §4/§8) ---
     // The Orchestrator supervisor + all four sub-agents run in ONE process.
@@ -133,6 +137,10 @@ export class MathModelerStack extends Stack {
         MM_ORCHESTRATION: 'supervisor',
       },
     });
+    // Runtime must wait until mount targets + access point are fully available.
+    if (!externalAccessPointArn) {
+      orchestrator.node.addDependency(accessPoint);
+    }
 
 
     // --- DynamoDB: Chat History (cross-browser session persistence) ---
