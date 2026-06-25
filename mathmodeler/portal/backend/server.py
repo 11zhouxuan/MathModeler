@@ -484,6 +484,24 @@ async def cancel(request: Request, _: None = Depends(_require_auth)) -> JSONResp
     return JSONResponse(result)
 
 
+# --- session status (check if background task is running) ------------------
+@app.get("/api/session-status")
+async def session_status(session_id: str = "", _: None = Depends(_require_auth)) -> JSONResponse:
+    """Query orchestrator for background task status of a session."""
+    if not session_id:
+        return JSONResponse({"status": "idle", "session_id": ""})
+    try:
+        from mm_common import invoke
+        result = invoke.invoke_agent(
+            AGENT_ARN,
+            {"action": "status", "session_id": session_id},
+            session_id,
+        )
+        return JSONResponse(result)
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"status": "idle", "session_id": session_id, "error": "unreachable"})
+
+
 # --- chat history persistence (DynamoDB, cross-browser) --------------------
 
 @app.get("/api/sessions")

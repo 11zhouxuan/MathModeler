@@ -2,6 +2,7 @@ import * as path from 'path';
 import { Construct } from 'constructs';
 import * as cdk from 'aws-cdk-lib';
 import * as agentcore from '@aws-cdk/aws-bedrock-agentcore-alpha';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import { Platform } from 'aws-cdk-lib/aws-ecr-assets';
@@ -20,6 +21,12 @@ export interface AgentRuntimeProps {
   extraEnv?: { [k: string]: string };
   /** Solver needs the Code Interpreter permissions. */
   needsCodeInterpreter?: boolean;
+  /** VPC for S3 Files mount (optional — if not set, uses session storage). */
+  vpc?: ec2.IVpc;
+  /** Security group for NFS mount traffic. */
+  securityGroup?: ec2.ISecurityGroup;
+  /** S3 Files access point ARN (if set, replaces session storage). */
+  s3FilesAccessPointArn?: string;
 }
 
 /**
@@ -86,6 +93,14 @@ export class AgentRuntime extends Construct {
       iam.ManagedPolicy.fromAwsManagedPolicyName('CloudWatchLogsFullAccess'),
     );
 
+    // S3 Files service permissions (when using S3 Files mount).
+    if (props.s3FilesAccessPointArn) {
+      this.role.addToPolicy(new iam.PolicyStatement({
+        actions: ['s3files:GetAccessPoint', 's3files:GetFileSystem', 's3files:GetMountTarget'],
+        resources: ['*'],
+      }));
+    }
+
     const runtime = new agentcore.Runtime(this, 'Runtime', {
       runtimeName: props.name,
       agentRuntimeArtifact: agentcore.AgentRuntimeArtifact.fromAsset(REPO_ROOT, {
@@ -95,13 +110,9 @@ export class AgentRuntime extends Construct {
       executionRole: this.role,
       environmentVariables: {
         AWS_REGION: 'us-west-2',
-        // Claude Opus requires a cross-region inference profile (on-demand
-        // foundation-model id is rejected by ConverseStream).
         MODEL_ID: 'us.anthropic.claude-opus-4-6-v1',
         DOC_BUCKET: props.bucket.bucketName,
-
         MEMORY_ID: props.memory.memoryId,
-        // Workspace root for session artifacts (Managed filesystem in Runtime).
         MM_WORKSPACE_ROOT: "/mnt/workspace/jobs",
         ...(props.extraEnv ?? {}),
       },
@@ -109,9 +120,32 @@ export class AgentRuntime extends Construct {
 
     // Escape hatch: L2 construct doesn't expose these yet.
     const cfnRuntime = runtime.node.defaultChild as CfnRuntime;
-    cfnRuntime.addPropertyOverride('FilesystemConfigurations', [
-      { SessionStorage: { MountPath: '/mnt/workspace' } },
-    ]);
+
+    if (props.s3FilesAccessPointArn && props.vpc && props.securityGroup) {
+      // VPC mode + S3 Files mount
+      const subnets = props.vpc.publicSubnets.slice(0, 3).map(s => s.subnetId);
+      cfnRuntime.addPropertyOverride('NetworkConfiguration', {
+        NetworkMode: 'VPC',
+        NetworkModeConfig: {
+          SecurityGroups: [props.securityGroup.securityGroupId],
+          Subnets: subnets,
+        },
+      });
+      cfnRuntime.addPropertyOverride('FilesystemConfigurations', [
+        {
+          S3FilesAccessPoint: {
+            AccessPointArn: props.s3FilesAccessPointArn,
+            MountPath: '/mnt/workspace',
+          },
+        },
+      ]);
+    } else {
+      // Fallback: managed session storage (no VPC required).
+      cfnRuntime.addPropertyOverride('FilesystemConfigurations', [
+        { SessionStorage: { MountPath: '/mnt/workspace' } },
+      ]);
+    }
+
     cfnRuntime.addPropertyOverride('LifecycleConfiguration', {
       IdleRuntimeSessionTimeout: 28800,
       MaxLifetime: 28800,

@@ -28,7 +28,7 @@ import asyncio
 import json
 import logging
 
-from mm_common import config, events, memory, s3_io, workspace
+from mm_common import background, config, events, memory, s3_io, workspace
 
 # Emit INFO-level logs to stdout so the orchestrator's tool calls / sub-agent
 # activity are visible in the container/uvicorn logs (otherwise only uvicorn's
@@ -57,8 +57,7 @@ def _configure_mm_logging() -> None:
 _configure_mm_logging()
 logger = logging.getLogger("mm.orchestrator")
 
-# Start the S3 workspace watcher thread (polls every 2s for new/modified files).
-workspace.start_s3_watcher()
+# S3 Files mount handles sync automatically — no watcher needed.
 
 
 from mm_common.llm import build_agent
@@ -121,6 +120,8 @@ def cancel_session(session_id: str) -> bool:
     sup = _RUNNING.get(session_id)
     if not sup:
         logger.warning("[orchestrator] CANCEL session=%s — NOT FOUND in _RUNNING", session_id)
+        # Still try to cancel the background task
+        background.cancel_task(session_id)
         return False
     logger.info("[orchestrator] CANCEL session=%s", session_id)
     try:
@@ -132,6 +133,7 @@ def cancel_session(session_id: str) -> bool:
             a.cancel()
         except Exception:  # noqa: BLE001
             pass
+    background.cancel_task(session_id)
     return True
 
 
@@ -179,15 +181,11 @@ def _build_task(body: dict) -> str:
 
 
 
-async def stream_supervisor(body: dict):
-    """Async SSE generator (AI SDK v6 frames) driving the streaming Supervisor."""
+async def _run_supervisor_bg(session_task: background.SessionTask, body: dict):
+    """Background coroutine: runs supervisor and appends frames to session_task buffer."""
     session_id = body["session_id"]
     problem = body.get("problem", "")
-    logger.info(
-        "[orchestrator] /invocations session=%s problem_len=%d keys=%s",
-        session_id, len(problem or ""), sorted(body.keys()),
-    )
-    # Initialize session workspace (creates directory structure)
+
     workspace.init_session(session_id)
     set_session_context(session_id)
 
@@ -203,17 +201,11 @@ async def stream_supervisor(body: dict):
         sup.restore(_state_store().load(session_id))
         gen = sup.stream(resume=interrupt_responses)
     else:
-        # Try to restore previous state so _completed cache is loaded.
-        # This allows the supervisor to skip already-finished sub-agents
-        # when a session is continued after a disconnect.
         saved = _state_store().load(session_id)
         if saved and saved.get("completed"):
             logger.info("[orchestrator] CONTINUE session=%s (restoring %d completed tasks)",
                         session_id, len(saved["completed"]))
-            # Only restore _completed cache, not interrupt state.
-            # Interrupt state would force Strands to expect interruptResponses.
             sup._completed.update(saved.get("completed", {}))
-            # Inject system reminder about disconnect recovery into the task
             completed_keys = list(saved["completed"].keys())
             completed_info = ", ".join(
                 k.replace("\x1f", "/") for k in completed_keys
@@ -238,17 +230,52 @@ async def stream_supervisor(body: dict):
 
     try:
         async for frame in tx.run(gen):
-            yield frame
-    except (GeneratorExit, asyncio.CancelledError) as e:
-        logger.info("[orchestrator] stream DISCONNECTED (client gone) session=%s: %s", session_id, e, exc_info=True)
+            session_task.append(frame)
     except Exception as e:
-        logger.info("[orchestrator] stream_supervisor error session=%s: %s", session_id, e, exc_info=True)
+        logger.exception("[orchestrator] background task error session=%s: %s", session_id, e)
+        session_task.append(f"data: {{\"type\":\"error\",\"errorText\":\"{e!s}\"}}\n\n")
     finally:
         set_busy(False)
-        logger.info("[orchestrator] stream_supervisor ENDED session=%s", session_id)
+        logger.info("[orchestrator] background task ENDED session=%s", session_id)
         _RUNNING.pop(session_id, None)
-        # Best-effort: stop any Solver Code Interpreter session opened for this run.
         _teardown_subagents(sup)
+
+
+async def stream_supervisor(body: dict):
+    """SSE endpoint handler: subscribe to background task (create if needed)."""
+    session_id = body["session_id"]
+    problem = body.get("problem", "")
+    logger.info(
+        "[orchestrator] /invocations session=%s problem_len=%d keys=%s",
+        session_id, len(problem or ""), sorted(body.keys()),
+    )
+
+    task = background.get_task(session_id)
+
+    if task and (task.is_running or task.done.is_set()):
+        # Existing task — try to subscribe
+        if not task.try_subscribe():
+            yield "data: {\"type\":\"error\",\"errorText\":\"session_busy\"}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+        state = "RECONNECT" if task.is_running else "REPLAY"
+        logger.info("[orchestrator] %s session=%s (buffer=%d)", state, session_id, len(task.events))
+    else:
+        # No task — launch a new background task
+        def _make_coro(captured_body):
+            async def _coro(st):
+                await _run_supervisor_bg(st, captured_body)
+            return _coro
+
+        task = background.create_task(session_id, _make_coro(body))
+        task.try_subscribe()
+        logger.info("[orchestrator] NEW background task session=%s", session_id)
+
+    try:
+        async for frame in task.subscribe():
+            yield frame
+    except (GeneratorExit, asyncio.CancelledError):
+        logger.info("[orchestrator] subscriber DISCONNECTED session=%s", session_id)
 
 
 
@@ -343,8 +370,23 @@ def _run(body: dict, emit=None) -> dict:
 def run_pipeline(body: dict) -> dict:
     """Synchronous (non-streaming) entry — returns the final SolveResponse JSON.
 
-    Always uses the deterministic pipeline (the supervisor path is streaming-only).
+    Handles special actions (status, cancel) or falls back to deterministic pipeline.
     """
+    action = body.get("action")
+    if action == "status":
+        session_id = body.get("session_id", "")
+        task = background.get_task(session_id)
+        if task is None:
+            return {"status": "idle", "session_id": session_id}
+        if task.is_running:
+            status = "running_connected" if task._has_subscriber else "running"
+        else:
+            status = "completed"
+        return {"status": status, "session_id": session_id}
+    if action == "cancel":
+        session_id = body.get("session_id", "")
+        found = cancel_session(session_id) if session_id else False
+        return {"cancelled": found, "session_id": session_id}
     return _run(body, emit=None)
 
 
@@ -390,4 +432,21 @@ async def _cancel_route(request: _CancelRequest) -> _CancelResponse:
     session_id = (body or {}).get("session_id", "")
     found = cancel_session(session_id) if session_id else False
     return _CancelResponse({"cancelled": found, "session_id": session_id})
+
+
+@app.post("/status")
+async def _status_route(request: _CancelRequest) -> _CancelResponse:
+    """Return the current state of a session's background task."""
+    body = await request.json()
+    session_id = (body or {}).get("session_id", "")
+    if not session_id:
+        return _CancelResponse({"status": "idle", "session_id": ""})
+    task = background.get_task(session_id)
+    if task is None:
+        return _CancelResponse({"status": "idle", "session_id": session_id})
+    if task.is_running:
+        status = "running_connected" if task._has_subscriber else "running"
+    else:
+        status = "completed"
+    return _CancelResponse({"status": status, "session_id": session_id})
 

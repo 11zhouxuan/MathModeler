@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     texlive-xetex \
     latexmk \
     fontconfig \
+    bubblewrap \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

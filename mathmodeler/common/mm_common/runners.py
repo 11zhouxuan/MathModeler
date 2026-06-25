@@ -153,9 +153,11 @@ try:
             description: ≤10字中文动作摘要（展示给用户）。
             command: The shell command to execute.
         """
+        from mm_common.sandbox import wrap_command
         try:
+            actual_cmd = wrap_command(command, _current_session_id) if _current_session_id else command
             result = _subprocess_mod.run(
-                command, shell=True, capture_output=True, text=True, timeout=60
+                actual_cmd, shell=True, capture_output=True, text=True, timeout=60
             )
             output = result.stdout
             if result.returncode != 0:

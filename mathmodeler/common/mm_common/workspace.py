@@ -34,7 +34,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import threading
 from pathlib import Path
 
 logger = logging.getLogger("mm.workspace")
@@ -50,127 +49,9 @@ def _ensure_root() -> None:
     WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
 
 
-# ---------------------------------------------------------------------------
-# S3 Sync — polling watcher thread that monitors workspace for changes
-# ---------------------------------------------------------------------------
-_s3_client = None
-_s3_watcher_started = False
-_s3_file_state: dict[str, float] = {}  # {absolute_path: mtime}
-
-
-def _s3_enabled() -> bool:
-    """Return True when S3 sync is configured (DOC_BUCKET set)."""
-    from . import config
-    return bool(config.DOC_BUCKET)
-
-
-def _get_s3_client():
-    """Lazy-init a boto3 S3 client (reused across the background thread)."""
-    global _s3_client
-    if _s3_client is None:
-        import boto3
-        from . import config
-        _s3_client = boto3.client("s3", region_name=config.REGION)
-    return _s3_client
-
-
-def _s3_key(session_id: str, rel: str) -> str:
-    """S3 key: jobs/{session_id}/{rel_path}."""
-    return f"jobs/{session_id}/{rel}"
-
-
-def _s3_watcher() -> None:
-    """Background thread: poll workspace root every 2s, upload new/modified files."""
-    import time as _time
-    from . import config
-
-    while True:
-        _time.sleep(2)
-        try:
-            if not WORKSPACE_ROOT.exists():
-                continue
-            # Scan all session directories
-            for session_dir in WORKSPACE_ROOT.iterdir():
-                if not session_dir.is_dir():
-                    continue
-                session_id = session_dir.name
-                # Walk all files in the session
-                for file_path in session_dir.rglob("*"):
-                    if not file_path.is_file():
-                        continue
-                    abs_str = str(file_path)
-                    try:
-                        mtime = file_path.stat().st_mtime
-                    except OSError:
-                        continue
-                    # Check if new or modified
-                    prev_mtime = _s3_file_state.get(abs_str)
-                    if prev_mtime is not None and prev_mtime >= mtime:
-                        continue
-                    # Upload to S3
-                    rel = str(file_path.relative_to(session_dir))
-                    key = _s3_key(session_id, rel)
-                    try:
-                        data = file_path.read_bytes()
-                        _get_s3_client().put_object(
-                            Bucket=config.DOC_BUCKET,
-                            Key=key,
-                            Body=data,
-                        )
-                        _s3_file_state[abs_str] = mtime
-                        logger.info("[workspace:s3] synced %s (%d bytes)", key, len(data))
-                    except Exception as e:  # noqa: BLE001
-                        logger.warning("[workspace:s3] upload failed %s: %s", key, e)
-        except Exception:  # noqa: BLE001
-            pass
-
-
 def start_s3_watcher() -> None:
-    """Start the S3 polling watcher thread (call once at server startup)."""
-    global _s3_watcher_started
-    if _s3_watcher_started or not _s3_enabled():
-        return
-    _s3_watcher_started = True
-    t = threading.Thread(target=_s3_watcher, daemon=True, name="ws-s3-watcher")
-    t.start()
-    logger.info("[workspace:s3] watcher thread started (polling every 2s)")
-
-
-def _s3_restore(session_id: str) -> None:
-    """Download all files from S3 prefix jobs/{session_id}/ to local workspace.
-
-    Called during init_session to recover workspace state after a runtime restart.
-    Skips files that already exist locally (local is authoritative if present).
-    """
-    if not _s3_enabled():
-        return
-    from . import config
-
-    prefix = f"jobs/{session_id}/"
-    base = WORKSPACE_ROOT / session_id
-    try:
-        client = _get_s3_client()
-        paginator = client.get_paginator("list_objects_v2")
-        restored = 0
-        for page in paginator.paginate(Bucket=config.DOC_BUCKET, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                rel = key[len(prefix):]
-                if not rel:
-                    continue
-                local_path = base / rel
-                if local_path.exists():
-                    continue
-                local_path.parent.mkdir(parents=True, exist_ok=True)
-                resp = client.get_object(Bucket=config.DOC_BUCKET, Key=key)
-                local_path.write_bytes(resp["Body"].read())
-                # Track mtime so watcher doesn't re-upload restored files
-                _s3_file_state[str(local_path)] = local_path.stat().st_mtime
-                restored += 1
-        if restored:
-            logger.info("[workspace:s3] restored %d files for session %s", restored, session_id)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("[workspace:s3] restore failed for session %s: %s", session_id, e)
+    """No-op: S3 Files mount handles sync automatically."""
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -186,12 +67,10 @@ def session_path(session_id: str) -> Path:
 def init_session(session_id: str) -> Path:
     """Initialize a session workspace with the standard directory structure.
 
-    If S3 has files under jobs/{session_id}/, they are restored to local workspace
-    first (handles runtime restart recovery).
+    S3 Files mount handles persistence — files survive session stop/resume
+    and are visible in the backing S3 bucket automatically.
     """
     base = session_path(session_id)
-    # Restore from S3 before creating subdirs (so we recover prior state)
-    _s3_restore(session_id)
     for subdir in ["data", "analysis", "modeling", "solving", "solving/figures",
                    "report", "report/figures"]:
         (base / subdir).mkdir(parents=True, exist_ok=True)

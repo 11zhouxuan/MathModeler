@@ -16,6 +16,24 @@ import { FilePreview, type PreviewFile } from './file-preview';
 
 type Ask = { interruptId?: string; question?: string; agent?: string };
 
+async function checkSessionStatus(
+  sessionId: string,
+  token: string,
+  apiBase: string,
+): Promise<string> {
+  try {
+    const res = await fetch(
+      `${apiBase}/api/session-status?session_id=${encodeURIComponent(sessionId)}`,
+      { headers: { Authorization: 'Bearer ' + token } },
+    );
+    if (!res.ok) return 'idle';
+    const data = await res.json();
+    return data.status || 'idle';
+  } catch {
+    return 'idle';
+  }
+}
+
 export function Chat({
   id,
   initialMessages,
@@ -92,6 +110,65 @@ export function Chat({
     transport,
   });
 
+  // Session-busy redirect state
+  const [sessionBusy, setSessionBusy] = useState(false);
+
+  // Auto-reconnect: on mount, check if background task is running for this session.
+  // If so, automatically send a "继续" message to attach to the live stream.
+  const didAutoReconnect = useRef(false);
+  useEffect(() => {
+    if (didAutoReconnect.current) return;
+    if (!sessionRef.current || initialMessages.length === 0) return;
+    didAutoReconnect.current = true;
+
+    (async () => {
+      const st = await checkSessionStatus(sessionRef.current, token, apiBase);
+      if (st === 'running') {
+        sendMessage({ text: '继续' });
+      } else if (st === 'running_connected') {
+        setSessionBusy(true);
+      }
+    })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Detect session_busy error in stream and show redirect message
+  useEffect(() => {
+    if (!error) return;
+    const msg = String((error as any).message || error);
+    if (msg.includes('session_busy')) {
+      setSessionBusy(true);
+    }
+  }, [error]);
+
+  // Auto-reconnect on unexpected disconnect (status goes from streaming to ready
+  // without a [DONE] / data-final in the messages). We detect this by checking
+  // if the last assistant message has no 'data-final' part when streaming ends.
+  const prevStatusRef = useRef(status);
+  useEffect(() => {
+    const prev = prevStatusRef.current;
+    prevStatusRef.current = status;
+    if (prev === 'streaming' && status === 'ready') {
+      // Check if the stream ended normally (has data-final or error)
+      const lastAssistant = [...messages].reverse().find((m: any) => m.role === 'assistant');
+      if (!lastAssistant) return;
+      const parts = (lastAssistant as any).parts || [];
+      const hasFinish = parts.some(
+        (p: any) => p.type === 'data-final' || p.type === 'error',
+      );
+      if (!hasFinish) {
+        // Abnormal disconnect — auto-reconnect after short delay
+        setTimeout(() => {
+          checkSessionStatus(sessionRef.current, token, apiBase).then((st) => {
+            if (st === 'running') {
+              sendMessage({ text: '继续' });
+            }
+          });
+        }, 2000);
+      }
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status]);
 
   // Capture the backend session id + derive the task list + HITL ask.
   const { taskList, ask } = useMemo(() => {
@@ -270,7 +347,22 @@ export function Chat({
                   </div>
                 </div>
               </div>
-              {error && (
+              {sessionBusy && (
+                <div
+                  className="mt-2 rounded-md border border-amber-400/40 bg-amber-50 px-3 py-2 text-amber-800 text-sm dark:bg-amber-950/30 dark:text-amber-200"
+                  role="alert"
+                >
+                  该会话正在其他页面运行。
+                  <button
+                    type="button"
+                    onClick={() => window.location.replace('/')}
+                    className="ml-2 underline hover:no-underline"
+                  >
+                    返回首页
+                  </button>
+                </div>
+              )}
+              {error && !sessionBusy && (
                 <div
                   className="mt-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-destructive text-sm"
                   role="alert"
