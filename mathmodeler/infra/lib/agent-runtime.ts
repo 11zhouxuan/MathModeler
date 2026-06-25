@@ -97,6 +97,7 @@ export class AgentRuntime extends Construct {
     if (props.s3FilesAccessPointArn) {
       this.role.addToPolicy(new iam.PolicyStatement({
         actions: [
+          's3files:ClientMount', 's3files:ClientWrite',
           's3files:GetAccessPoint', 's3files:GetFileSystem',
           's3files:GetMountTarget', 's3files:ListMountTargets',
         ],
