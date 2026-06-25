@@ -55,6 +55,8 @@ export class MathModelerStack extends Stack {
       description: 'SG for S3 Files mount targets + AgentCore Runtime',
       allowAllOutbound: true,
     });
+    // Self-referencing NFS rule: Runtime microVM ↔ mount target (same SG).
+    s3filesSg.addIngressRule(s3filesSg, ec2.Port.tcp(2049), 'NFS from self');
 
     // S3 Files service role — assumes elasticfilesystem.amazonaws.com to sync
     // data between the file system and the backing S3 bucket.
