@@ -118,6 +118,7 @@ export class AgentRuntime extends Construct {
         DOC_BUCKET: props.bucket.bucketName,
         MEMORY_ID: props.memory.memoryId,
         MM_WORKSPACE_ROOT: "/mnt/workspace/jobs",
+        DEPLOY_VERSION: '2',
         ...(props.extraEnv ?? {}),
       },
     });
