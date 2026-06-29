@@ -35,4 +35,5 @@ COPY HMML /app/HMML
 ENV MM_WORKSPACE_ROOT=/app/jobs
 
 EXPOSE 8080
+LABEL deploy.revision="2026-06-29-bg-exec"
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
