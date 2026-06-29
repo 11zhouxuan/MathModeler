@@ -50,6 +50,13 @@ export class MathModelerStack extends Stack {
     // Use default VPC (public subnets have internet; no NAT Gateway cost).
     const vpc = ec2.Vpc.fromLookup(this, 'DefaultVpc', { isDefault: true });
 
+    // S3 Gateway Endpoint — required for AgentCore VPC mode to pull images
+    // and for S3 Files NFS mount to sync with the backing bucket.
+    new ec2.GatewayVpcEndpoint(this, 'S3Endpoint', {
+      vpc,
+      service: ec2.GatewayVpcEndpointAwsService.S3,
+    });
+
     const s3filesSg = new ec2.SecurityGroup(this, 'S3FilesSG', {
       vpc,
       description: 'SG for S3 Files mount targets + AgentCore Runtime',
