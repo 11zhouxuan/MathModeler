@@ -251,17 +251,19 @@ async def stream_supervisor(body: dict):
     )
 
     task = background.get_task(session_id)
+    has_interrupt = bool(body.get("interruptResponses"))
 
-    if task and (task.is_running or task.done.is_set()):
-        # Existing task — try to subscribe
+    if task and task.is_running and not has_interrupt:
+        # Running task, no interrupt — reconnect (full replay + live tail)
         if not task.try_subscribe():
             yield "data: {\"type\":\"error\",\"errorText\":\"session_busy\"}\n\n"
             yield "data: [DONE]\n\n"
             return
-        state = "RECONNECT" if task.is_running else "REPLAY"
-        logger.info("[orchestrator] %s session=%s (buffer=%d)", state, session_id, len(task.events))
+        logger.info("[orchestrator] RECONNECT session=%s (buffer=%d)", session_id, len(task.events))
     else:
-        # No task — launch a new background task
+        # New task or HITL resume — always start fresh background task.
+        # (interruptResponses will be handled inside _run_supervisor_bg via
+        # Supervisor.restore + stream(resume=...) )
         def _make_coro(captured_body):
             async def _coro(st):
                 await _run_supervisor_bg(st, captured_body)
@@ -269,7 +271,8 @@ async def stream_supervisor(body: dict):
 
         task = background.create_task(session_id, _make_coro(body))
         task.try_subscribe()
-        logger.info("[orchestrator] NEW background task session=%s", session_id)
+        reason = "RESUME" if has_interrupt else "NEW"
+        logger.info("[orchestrator] %s background task session=%s", reason, session_id)
 
     try:
         async for frame in task.subscribe():
