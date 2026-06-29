@@ -126,8 +126,12 @@ export class AgentRuntime extends Construct {
     const cfnRuntime = runtime.node.defaultChild as CfnRuntime;
 
     if (props.s3FilesAccessPointArn && props.vpc && props.securityGroup) {
-      // VPC mode + S3 Files mount
-      const subnets = props.vpc.publicSubnets.slice(0, 3).map(s => s.subnetId);
+      // VPC mode + S3 Files mount.
+      // AgentCore microVMs don't get public IPs, so they need private subnets
+      // with NAT Gateway for internet access (ECR pull, etc.).
+      const subnets = props.vpc.privateSubnets.length > 0
+        ? props.vpc.privateSubnets.slice(0, 3).map(s => s.subnetId)
+        : props.vpc.publicSubnets.slice(0, 3).map(s => s.subnetId);
       cfnRuntime.addPropertyOverride('NetworkConfiguration', {
         NetworkMode: 'VPC',
         NetworkModeConfig: {

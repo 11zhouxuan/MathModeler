@@ -101,11 +101,10 @@ export class MathModelerStack extends Stack {
       acceptBucketWarning: true,
     });
 
-    // Mount targets — one per public subnet (max 3 to stay within limits).
-    // Mount targets take 1-3 minutes to become available; the Runtime must
-    // wait for them via an explicit dependency.
-    const subnets = vpc.publicSubnets.slice(0, 3);
-    const mountTargets = subnets.map((subnet, i) =>
+    // Mount targets — in private subnets (where Runtime microVMs run) + public
+    // subnets for coverage. AgentCore microVMs need private subnets with NAT.
+    const allSubnets = [...vpc.privateSubnets, ...vpc.publicSubnets].slice(0, 3);
+    const mountTargets = allSubnets.map((subnet, i) =>
       new s3files.CfnMountTarget(this, `MountTarget${i}`, {
         fileSystemId: fileSystem.attrFileSystemId,
         subnetId: subnet.subnetId,
