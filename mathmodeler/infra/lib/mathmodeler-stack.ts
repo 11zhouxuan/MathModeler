@@ -101,10 +101,10 @@ export class MathModelerStack extends Stack {
       acceptBucketWarning: true,
     });
 
-    // Mount targets — in private subnets (where Runtime microVMs run) + public
-    // subnets for coverage. AgentCore microVMs need private subnets with NAT.
-    const allSubnets = [...vpc.privateSubnets, ...vpc.publicSubnets].slice(0, 3);
-    const mountTargets = allSubnets.map((subnet, i) =>
+    // Mount targets in public subnets (one per AZ, max 3). NFS traffic stays
+    // within the VPC regardless of subnet type, so mount targets in public
+    // subnets are reachable from Runtime microVMs in private subnets.
+    const mountTargets = vpc.publicSubnets.slice(0, 3).map((subnet, i) =>
       new s3files.CfnMountTarget(this, `MountTarget${i}`, {
         fileSystemId: fileSystem.attrFileSystemId,
         subnetId: subnet.subnetId,
