@@ -31,7 +31,35 @@ def load_session_history(session_id: str) -> list[dict]:
     raw_messages = _load_from_memory(session_id)
     if not raw_messages:
         return []
-    return _map_to_ai_sdk(raw_messages, session_id)
+    # Load pending interrupts from StateStore to get correct interrupt IDs
+    pending = _load_pending_interrupts(session_id)
+    return _map_to_ai_sdk(raw_messages, session_id, pending)
+
+
+def _load_pending_interrupts(session_id: str) -> dict[str, str]:
+    """Load pending interrupt mapping from S3 StateStore.
+
+    Returns {toolUseId: full_interrupt_key} so we can map ask_user tool calls
+    to the correct Strands interrupt IDs needed for resume.
+    """
+    from .state_store import S3StateStore
+    try:
+        store = S3StateStore()
+        state = store.load(session_id)
+        if not state or "pending" not in state:
+            return {}
+        # pending: {full_interrupt_key: {agent, question, ...}}
+        # Build reverse map: toolUseId -> full_interrupt_key
+        mapping = {}
+        for key in state["pending"]:
+            # key format: "v1:tool_call:{toolUseId}:{cycle_id}"
+            parts = key.split(":")
+            if len(parts) >= 3:
+                tool_use_id = parts[2]
+                mapping[tool_use_id] = key
+        return mapping
+    except Exception:
+        return {}
 
 
 def _load_from_memory(session_id: str) -> list[dict]:
@@ -61,15 +89,17 @@ def _load_from_memory(session_id: str) -> list[dict]:
         return []
 
 
-def _map_to_ai_sdk(messages: list[dict], session_id: str) -> list[dict]:
+def _map_to_ai_sdk(messages: list[dict], session_id: str,
+                    pending: dict[str, str] | None = None) -> list[dict]:
     """Map Strands messages to AI SDK v6 UIMessage format.
 
     Strands format: [{role, content: [text/toolUse/toolResult]}]
     AI SDK format: [{id, role, parts: [text/data-stage/data-task/data-ask/tool-*]}]
+
+    pending: {toolUseId: full_interrupt_key} for correct interruptId mapping.
     """
     result: list[dict] = []
-    # First message from user contains the problem
-    user_msg_idx = 0
+    _pending = pending or {}
 
     # Collect all messages into user/assistant groups
     i = 0
@@ -113,7 +143,7 @@ def _map_to_ai_sdk(messages: list[dict], session_id: str) -> list[dict]:
                 else:
                     break
 
-            parts = _map_assistant_turn(assistant_blocks, tool_results)
+            parts = _map_assistant_turn(assistant_blocks, tool_results, _pending)
             if parts:
                 result.append({
                     "id": _gen_id(),
@@ -156,9 +186,11 @@ def _map_user_message(content: list[dict], is_first: bool, session_id: str) -> l
     return parts
 
 
-def _map_assistant_turn(blocks: list[dict], tool_results: dict[str, Any]) -> list[dict]:
+def _map_assistant_turn(blocks: list[dict], tool_results: dict[str, Any],
+                        pending: dict[str, str] | None = None) -> list[dict]:
     """Map an assistant turn's content blocks + tool results to AI SDK parts."""
     parts = []
+    _pending = pending or {}
 
     for blk in blocks:
         if "text" in blk:
@@ -188,13 +220,16 @@ def _map_assistant_turn(blocks: list[dict], tool_results: dict[str, Any]) -> lis
                     })
 
             elif name == "ask_user":
-                question = tool_input.get("question", "")
+                question = tool_input.get("question", tool_input.get("prompt", ""))
                 agent = tool_input.get("agent", "supervisor")
+                # Use the full Strands interrupt key (from StateStore pending map)
+                # so the frontend can correctly resume with interruptResponses.
+                interrupt_id = _pending.get(tool_id, tool_id)
                 parts.append({
                     "type": "data-ask",
-                    "id": tool_id,
+                    "id": interrupt_id,
                     "data": {
-                        "interruptId": tool_id,
+                        "interruptId": interrupt_id,
                         "question": question,
                         "agent": agent,
                     },
