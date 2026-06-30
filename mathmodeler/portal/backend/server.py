@@ -300,124 +300,22 @@ def _iter_chat_stream(body: dict):
     if interrupt_responses is not None:
         payload["interruptResponses"] = interrupt_responses
 
-    # Accumulate raw SSE frames server-side for DDB persistence.
-    accumulated_frames: list[str] = []
-
     try:
         for raw in invoke.stream_agent(AGENT_ARN, payload, sid):
             raw = raw.strip()
             if not raw:
-                # Empty string = upstream SSE comment (heartbeat); forward as
-                # SSE comment to keep ALB → browser connection alive.
                 yield ":\n\n"
                 continue
-            # The orchestrator already speaks AI SDK v6 wire frames; relay as-is.
-            # Suppress the orchestrator's own [DONE] so we can append our own.
             if raw == "[DONE]":
                 continue
-            accumulated_frames.append(raw)
             yield f"data: {raw}\n\n"
     except Exception as e:  # noqa: BLE001
         logger.error("[portal] stream error session=%s: %s", sid, e, exc_info=True)
         yield _sdk_frame({"type": "error", "errorText": str(e)})
     finally:
         yield "data: [DONE]\n\n"
-        # Server-side DDB save: persist the full conversation after stream ends.
-        # Save session metadata only (title for sidebar). Full history is
-        # reconstructed from AgentCore Memory on demand.
         from mm_common import chat_store
         chat_store.save_session_meta(sid, problem)
-
-
-def _save_chat_history_server_side(
-    session_id: str,
-    incoming_messages: list,
-    frames: list[str],
-    problem: str,
-) -> None:
-    """Reconstruct the full UI messages from incoming + SSE frames, save to DDB.
-
-    This runs server-side AFTER the stream ends, so even if the browser
-    disconnects mid-stream the DDB record is authoritative.
-
-    The incoming_messages already contain the user's messages as sent by the
-    frontend (AI SDK UIMessage format: [{role, id, parts}]). The SSE frames
-    represent the new assistant message. We parse them into an assistant
-    UIMessage with ordered parts, then save the whole conversation.
-    """
-    from mm_common import chat_store
-
-    try:
-        # Build the assistant message from accumulated SSE frames.
-        assistant_parts: list[dict] = []
-        assistant_id = ""
-
-        for raw in frames:
-            try:
-                frame = json.loads(raw)
-            except (json.JSONDecodeError, TypeError):
-                continue
-
-            ftype = frame.get("type", "")
-            fid = frame.get("id") or frame.get("messageId") or ""
-
-            if ftype == "start":
-                assistant_id = frame.get("messageId", assistant_id)
-            elif ftype == "text-delta":
-                # Merge consecutive text deltas into a single text part.
-                delta = frame.get("delta", "")
-                if assistant_parts and assistant_parts[-1].get("type") == "text":
-                    assistant_parts[-1]["text"] += delta
-                else:
-                    assistant_parts.append({"type": "text", "text": delta})
-            elif ftype in ("data-session", "data-agent-marker", "data-stage",
-                           "data-agent", "data-task", "data-ask", "data-final"):
-                assistant_parts.append({
-                    "type": ftype,
-                    "id": fid,
-                    "data": frame.get("data"),
-                })
-            elif ftype == "tool-input-start":
-                assistant_parts.append({
-                    "type": f"tool-{frame.get('toolName', 'tool')}",
-                    "toolCallId": frame.get("toolCallId"),
-                    "state": "input-available",
-                })
-            elif ftype == "tool-output-available":
-                # Find the matching tool part and add output.
-                tcid = frame.get("toolCallId")
-                for p in reversed(assistant_parts):
-                    if p.get("toolCallId") == tcid:
-                        p["state"] = "output-available"
-                        p["output"] = frame.get("output")
-                        break
-            elif ftype == "error":
-                assistant_parts.append({
-                    "type": "error",
-                    "text": frame.get("errorText", "unknown error"),
-                })
-
-        # Construct the full assistant UIMessage.
-        if not assistant_id:
-            assistant_id = uuid.uuid4().hex
-
-        assistant_msg = {
-            "role": "assistant",
-            "id": assistant_id,
-            "parts": assistant_parts,
-        }
-
-        # Build the full conversation: incoming messages + new assistant message.
-        full_messages = list(incoming_messages or []) + [assistant_msg]
-
-        chat_store.save_session(session_id, full_messages, problem=problem)
-        logger.info(
-            "[portal] server-side DDB save: session=%s n_messages=%d n_parts=%d",
-            session_id, len(full_messages), len(assistant_parts),
-        )
-    except Exception as e:  # noqa: BLE001 - persistence must never crash the response
-        logger.warning("[portal] server-side DDB save FAILED: session=%s err=%s", session_id, e)
-
 
 # --- health ----------------------------------------------------------------
 @app.get("/healthz")

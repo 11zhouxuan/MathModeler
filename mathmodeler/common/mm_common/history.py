@@ -24,16 +24,79 @@ _STAGE_OF = {
 
 
 def load_session_history(session_id: str) -> list[dict]:
-    """Load supervisor conversation from AgentCore Memory and map to AI SDK format.
+    """Load session history from AgentCore Memory and map to AI SDK format.
 
+    Loads supervisor conversation + sub-agent tool call details from Memory.
     Returns a list of UIMessages: [{id, role, parts}].
     """
     raw_messages = _load_from_memory(session_id)
     if not raw_messages:
         return []
-    # Load pending interrupts from StateStore to get correct interrupt IDs
     pending = _load_pending_interrupts(session_id)
-    return _map_to_ai_sdk(raw_messages, session_id, pending)
+    subagent_histories = _load_subagent_histories(session_id, raw_messages)
+    return _map_to_ai_sdk(raw_messages, session_id, pending, subagent_histories)
+
+
+def _load_subagent_histories(session_id: str, supervisor_messages: list[dict]) -> dict[str, list[dict]]:
+    """Load sub-agent conversation histories from AgentCore Memory.
+
+    Scans supervisor messages to find run_subagent calls, then loads each
+    sub-agent's history keyed by "{name}_{task_id}".
+
+    Returns {agent_key: [messages]} where messages are Strands format.
+    """
+    # Find all run_subagent calls to know which sub-agent sessions to load
+    agent_keys: set[str] = set()
+    for m in supervisor_messages:
+        for blk in m.get("content", []):
+            tu = blk.get("toolUse")
+            if tu and tu.get("name") == "run_subagent":
+                inp = tu.get("input", {})
+                name = inp.get("name", "")
+                task_id = inp.get("task_id", "")
+                if name and task_id:
+                    agent_keys.add(f"{name}_{task_id}")
+                elif name:
+                    agent_keys.add(name)
+
+    if not agent_keys:
+        return {}
+
+    result: dict[str, list[dict]] = {}
+    for key in agent_keys:
+        msgs = _load_agent_from_memory(session_id, key)
+        if msgs:
+            result[key] = msgs
+            logger.info("[history] loaded sub-agent %s: %d messages", key, len(msgs))
+
+    return result
+
+
+def _load_agent_from_memory(session_id: str, agent_key: str) -> list[dict]:
+    """Load a specific agent's messages from AgentCore Memory."""
+    if not config.MEMORY_ID:
+        return []
+    try:
+        from bedrock_agentcore.memory.integrations.strands.session_manager import AgentCoreMemorySessionManager
+        from bedrock_agentcore.memory.integrations.strands.config import AgentCoreMemoryConfig
+        from strands import Agent
+        from .llm import make_model
+
+        memory_config = AgentCoreMemoryConfig(
+            memory_id=config.MEMORY_ID,
+            session_id=f"{session_id}_{agent_key}",
+            actor_id="system",
+        )
+        sm = AgentCoreMemorySessionManager(
+            agentcore_memory_config=memory_config,
+            region_name=config.REGION,
+        )
+        agent = Agent(model=make_model(), system_prompt="", callback_handler=None)
+        sm.initialize(agent)
+        return list(agent.messages or [])
+    except Exception as e:
+        logger.warning("[history] failed to load agent %s: %s", agent_key, e)
+        return []
 
 
 def _load_pending_interrupts(session_id: str) -> dict[str, str]:
@@ -90,16 +153,19 @@ def _load_from_memory(session_id: str) -> list[dict]:
 
 
 def _map_to_ai_sdk(messages: list[dict], session_id: str,
-                    pending: dict[str, str] | None = None) -> list[dict]:
+                    pending: dict[str, str] | None = None,
+                    subagent_histories: dict[str, list[dict]] | None = None) -> list[dict]:
     """Map Strands messages to AI SDK v6 UIMessage format.
 
     Strands format: [{role, content: [text/toolUse/toolResult]}]
     AI SDK format: [{id, role, parts: [text/data-stage/data-task/data-ask/tool-*]}]
 
     pending: {toolUseId: full_interrupt_key} for correct interruptId mapping.
+    subagent_histories: {agent_key: [messages]} for sub-agent tool call details.
     """
     result: list[dict] = []
     _pending = pending or {}
+    _subagent_histories = subagent_histories or {}
 
     # Collect all messages into user/assistant groups
     i = 0
@@ -143,7 +209,7 @@ def _map_to_ai_sdk(messages: list[dict], session_id: str,
                 else:
                     break
 
-            parts = _map_assistant_turn(assistant_blocks, tool_results, _pending)
+            parts = _map_assistant_turn(assistant_blocks, tool_results, _pending, _subagent_histories)
             if parts:
                 result.append({
                     "id": _gen_id(),
@@ -187,10 +253,12 @@ def _map_user_message(content: list[dict], is_first: bool, session_id: str) -> l
 
 
 def _map_assistant_turn(blocks: list[dict], tool_results: dict[str, Any],
-                        pending: dict[str, str] | None = None) -> list[dict]:
+                        pending: dict[str, str] | None = None,
+                        subagent_histories: dict[str, list[dict]] | None = None) -> list[dict]:
     """Map an assistant turn's content blocks + tool results to AI SDK parts."""
     parts = []
     _pending = pending or {}
+    _subagent_histories = subagent_histories or {}
 
     for blk in blocks:
         if "text" in blk:
@@ -237,15 +305,20 @@ def _map_assistant_turn(blocks: list[dict], tool_results: dict[str, Any],
 
             elif name == "run_subagent":
                 agent_name = tool_input.get("name", "subagent")
+                task_id = tool_input.get("task_id", "")
                 stage = _STAGE_OF.get(agent_name, agent_name)
+                agent_key = f"{agent_name}_{task_id}" if task_id else agent_name
                 # Stage start
                 parts.append({
                     "type": "data-stage",
                     "id": _gen_id(),
                     "data": {"stage": stage, "status": "start", "agent": agent_name},
                 })
-                # Agent result as data-agent
-                if result_text:
+                # Build agent parts from sub-agent history (tool calls + text)
+                agent_parts = _build_subagent_parts(_subagent_histories.get(agent_key, []))
+                if not agent_parts and result_text:
+                    agent_parts = [{"type": "text", "text": result_text, "state": "done"}]
+                if agent_parts:
                     parts.append({
                         "type": "data-agent",
                         "id": _gen_id(),
@@ -253,7 +326,7 @@ def _map_assistant_turn(blocks: list[dict], tool_results: dict[str, Any],
                             "agent": agent_name,
                             "name": agent_name,
                             "stage": stage,
-                            "parts": [{"type": "text", "text": result_text, "state": "done"}],
+                            "parts": agent_parts,
                         },
                     })
                 # Stage done
@@ -275,6 +348,55 @@ def _map_assistant_turn(blocks: list[dict], tool_results: dict[str, Any],
                     part["output"] = result_text
                 parts.append(part)
 
+    return parts
+
+
+def _build_subagent_parts(messages: list[dict]) -> list[dict]:
+    """Build UI parts from a sub-agent's Strands conversation history.
+
+    Maps the sub-agent's tool calls (execute_code, write_file, etc.) into
+    tool-* parts matching the runtime SSE format.
+    """
+    if not messages:
+        return []
+    parts = []
+    # Collect tool uses and their results
+    tool_results_map: dict[str, str] = {}
+    for m in messages:
+        if m.get("role") == "user":
+            for blk in m.get("content", []):
+                tr = blk.get("toolResult")
+                if tr:
+                    texts = [c.get("text", "") for c in tr.get("content", []) if c.get("text")]
+                    tool_results_map[tr["toolUseId"]] = "\n".join(texts)
+
+    for m in messages:
+        if m.get("role") != "assistant":
+            continue
+        for blk in m.get("content", []):
+            if "text" in blk and blk["text"].strip():
+                parts.append({"type": "text", "text": blk["text"], "state": "done"})
+            elif "toolUse" in blk:
+                tu = blk["toolUse"]
+                tname = tu.get("name", "tool")
+                tid = tu.get("toolUseId", "")
+                tinput = tu.get("input", {})
+                output = tool_results_map.get(tid, "")
+                # Extract description for title
+                title = ""
+                if isinstance(tinput, dict) and "description" in tinput:
+                    title = str(tinput["description"])
+                part: dict = {
+                    "type": f"tool-{tname}",
+                    "toolCallId": tid,
+                    "state": "output-available" if output else "input-available",
+                    "input": tinput,
+                }
+                if title:
+                    part["title"] = title
+                if output:
+                    part["output"] = output
+                parts.append(part)
     return parts
 
 

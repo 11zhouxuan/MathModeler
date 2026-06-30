@@ -95,7 +95,7 @@ class Supervisor:
     def __init__(
         self,
         supervisor,
-        subagents: dict,
+        subagent_builders: dict[str, Callable],
         *,
         session_id: str | None = None,
         state_store=None,
@@ -103,7 +103,8 @@ class Supervisor:
         on_domain_event: Callable[[dict], None] | None = None,
     ):
         self.supervisor = supervisor
-        self.subagents = dict(subagents)
+        self.subagent_builders = subagent_builders
+        self.subagents: dict = {}  # kept for cancel support
         self.session_id = session_id
         self.state_store = state_store
         self.max_iterations = max_iterations
@@ -118,15 +119,16 @@ class Supervisor:
 
     # ------------------------------------------------------------------ tools
     def _inject_tools(self) -> None:
-        """Add run_subagent + ask_user + update_task + thinking to the supervisor;
-        ask_user + thinking to each sub-agent."""
+        """Add run_subagent + ask_user + update_task + thinking to the supervisor."""
         run_subagent = self._make_run_subagent()
         ask_user = self._make_ask_user()
         update_task = self._make_update_task()
         thinking = self._make_thinking()
         _append_tools(self.supervisor, [run_subagent, ask_user, update_task, thinking])
-        for sub in self.subagents.values():
-            _append_tools(sub, [self._make_ask_user(), self._make_thinking()])
+
+    def _inject_subagent_tools(self, sub) -> None:
+        """Inject ask_user + thinking into a freshly created sub-agent."""
+        _append_tools(sub, [self._make_ask_user(), self._make_thinking()])
 
     def _make_ask_user(self):
         @tool(context=True)
@@ -205,35 +207,11 @@ class Supervisor:
         return thinking
 
     def _make_run_subagent(self):
-        subagents = self.subagents
+        builders = self.subagent_builders
         completed = self._completed
         supervisor = self.supervisor
         _sup_self = self
         _session_id = self.session_id
-
-        def _load_subagent_messages(sub, name: str, task_id: str) -> None:
-            """Load sub-agent messages from AgentCore Memory for this specific task."""
-            try:
-                from mm_common.llm import make_session_manager
-                mem_session = f"{_session_id}_{name}_{task_id}" if task_id else f"{_session_id}_{name}"
-                sm = make_session_manager(_session_id, f"{name}_{task_id}" if task_id else name)
-                if sm is None:
-                    return
-                sm.initialize(sub)
-            except Exception:  # noqa: BLE001
-                pass
-
-        def _save_subagent_messages(sub, name: str, task_id: str) -> None:
-            """Save sub-agent messages to AgentCore Memory after task completion."""
-            try:
-                from mm_common.llm import make_session_manager
-                sm = make_session_manager(_session_id, f"{name}_{task_id}" if task_id else name)
-                if sm is None:
-                    return
-                # Manually save each message and sync state
-                sm.sync_agent(sub)
-            except Exception:  # noqa: BLE001
-                pass
 
 
         async def _drive(sub, name, prompt):
@@ -352,8 +330,8 @@ class Supervisor:
                 return
 
 
-            sub = subagents.get(name)
-            if sub is None:
+            builder = builders.get(name)
+            if builder is None:
                 msg = f"unknown subagent: {name}"
                 logger.warning("[supervisor] %s", msg)
                 yield {"status": "error", "content": [{"text": msg}]}
@@ -363,8 +341,14 @@ class Supervisor:
             logger.info("[supervisor] subagent %r START task_id=%s", name, effective_id)
             yield {"node": name, "stage_status": "start"}
 
-            # Load sub-agent conversation history from Memory (enables resume after disconnect).
-            _load_subagent_messages(sub, name, effective_id)
+            # Create a fresh agent with session_manager for this task.
+            # Strands will auto-persist messages to AgentCore Memory in real time.
+            from mm_common.llm import make_session_manager
+            agent_key = f"{name}_{effective_id}"
+            sm = make_session_manager(_session_id, agent_key)
+            sub = builder(session_manager=sm)
+            _sup_self._inject_subagent_tools(sub)
+            _sup_self.subagents[name] = sub  # track for cancel support
 
             gen = _drive(sub, name, subtask)
 
@@ -393,9 +377,7 @@ class Supervisor:
             text = _extract_text(r)
             completed[ckey] = text
             logger.info("[supervisor] subagent %r DONE (result %d chars)", name, len(text))
-            # Save sub-agent messages to Memory for future resume.
-            _save_subagent_messages(sub, name, effective_id)
-            # Persist supervisor state so progress survives disconnects.
+            # Strands session_manager auto-persists messages; just persist supervisor state.
             _sup_self._persist()
 
             yield {"node": name, "result_text": text}

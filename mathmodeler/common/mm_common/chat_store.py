@@ -54,62 +54,6 @@ def _ddb():
 # Public API
 # ---------------------------------------------------------------------------
 
-def save_session(
-    session_id: str,
-    messages: list[dict[str, Any]],
-    problem: str = "",
-    title: str | None = None,
-) -> None:
-    """Upsert a chat session: save metadata + individual messages.
-
-    Each message is stored as a separate DynamoDB item to avoid the 400KB limit.
-    Uses BatchWriteItem for efficiency.
-    """
-    if not session_id or not messages:
-        return
-    now = int(time.time())
-    derived_title = title or (problem[:24] if problem else "新会话")
-
-    try:
-        table = _ddb()
-
-        # 1. Upsert session metadata — only set title on first creation
-        table.update_item(
-            Key={"PK": "SESSION", "SK": session_id},
-            UpdateExpression="SET updated_at = :ts, msg_count = :mc"
-                            ", #t = if_not_exists(#t, :title)"
-                            ", problem = if_not_exists(problem, :prob)"
-                            ", created_at = if_not_exists(created_at, :ts)",
-            ExpressionAttributeNames={"#t": "title"},
-            ExpressionAttributeValues={
-                ":ts": now,
-                ":mc": len(messages),
-                ":title": derived_title,
-                ":prob": (problem or "")[:500],
-            },
-        )
-
-        # 2. Write messages in batches of 25 (DynamoDB batch limit)
-        with table.batch_writer() as batch:
-            for idx, msg in enumerate(messages):
-                parts_json = json.dumps(msg.get("parts", []), ensure_ascii=False, default=str)
-                # If single message item > 400KB, truncate parts
-                if len(parts_json.encode("utf-8")) > 380_000:
-                    parts_json = json.dumps(
-                        [{"type": "text", "text": "[消息内容过大，已省略]"}],
-                        ensure_ascii=False,
-                    )
-                batch.put_item(Item={
-                    "PK": f"MSG#{session_id}",
-                    "SK": f"{idx:06d}",
-                    "role": msg.get("role", "user"),
-                    "msg_id": msg.get("id", ""),
-                    "parts": parts_json,
-                })
-
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"[chat_store] save_session failed for {session_id}: {e}")
-
 
 def save_session_meta(session_id: str, problem: str = "", title: str | None = None) -> None:
     """Save only session metadata (title for sidebar). No message items."""
@@ -159,29 +103,6 @@ def list_sessions(limit: int = 50) -> list[dict[str, Any]]:
         return []
 
 
-def load_messages(session_id: str) -> list[dict[str, Any]]:
-    """Load all messages for a session (ordered by index)."""
-    if not session_id:
-        return []
-    try:
-        resp = _ddb().query(
-            KeyConditionExpression="PK = :pk",
-            ExpressionAttributeValues={":pk": f"MSG#{session_id}"},
-            ScanIndexForward=True,
-        )
-        messages = []
-        for item in resp.get("Items", []):
-            parts_raw = item.get("parts", "[]")
-            parts = json.loads(parts_raw) if isinstance(parts_raw, str) else parts_raw
-            messages.append({
-                "id": item.get("msg_id", ""),
-                "role": item.get("role", "user"),
-                "parts": parts,
-            })
-        return messages
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"[chat_store] load_messages failed for {session_id}: {e}")
-        return []
 
 
 def delete_session(session_id: str) -> None:

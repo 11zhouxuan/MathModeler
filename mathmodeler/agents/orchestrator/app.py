@@ -57,7 +57,6 @@ def _configure_mm_logging() -> None:
 _configure_mm_logging()
 logger = logging.getLogger("mm.orchestrator")
 
-# S3 Files mount handles sync automatically — no watcher needed.
 
 
 from mm_common.llm import build_agent
@@ -146,19 +145,19 @@ def _state_store():
 
 
 def build_supervisor(session_id: str) -> Supervisor:
-    """Construct the MathModeler Supervisor with the four in-process sub-agents."""
+    """Construct the MathModeler Supervisor with lazy sub-agent builders."""
     from mm_common.llm import make_session_manager
     sm = make_session_manager(session_id, "supervisor")
     supervisor_agent = build_agent(SUPERVISOR_SYSTEM, tools=list(BUILTIN_TOOLS), session_manager=sm)
-    subagents = {
-        "analyst": build_analyst_agent(session_id),
-        "modeler": build_modeler_agent(session_id),
-        "solver": build_solver_agent(session_id),
-        "reporter": build_reporter_agent(session_id),
+    subagent_builders = {
+        "analyst": lambda session_manager=None: build_analyst_agent(session_id, session_manager=session_manager),
+        "modeler": lambda session_manager=None: build_modeler_agent(session_id, session_manager=session_manager),
+        "solver": lambda session_manager=None: build_solver_agent(session_id, session_manager=session_manager),
+        "reporter": lambda session_manager=None: build_reporter_agent(session_id, session_manager=session_manager),
     }
     return Supervisor(
         supervisor=supervisor_agent,
-        subagents=subagents,
+        subagent_builders=subagent_builders,
         session_id=session_id,
         state_store=_state_store(),
     )
