@@ -118,7 +118,7 @@ export function Chat({
   const didAutoReconnect = useRef(false);
   useEffect(() => {
     if (didAutoReconnect.current) return;
-    if (!sessionRef.current || initialMessages.length === 0) return;
+    if (!sessionRef.current || !token) return;
     didAutoReconnect.current = true;
 
     (async () => {
@@ -130,7 +130,7 @@ export function Chat({
       }
     })();
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [token]);
 
   // Detect session_busy error in stream and show redirect message
   useEffect(() => {

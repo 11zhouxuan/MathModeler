@@ -61,6 +61,7 @@ def make_session_manager(session_id: str, agent_name: str):
             memory_id=config.MEMORY_ID,
             session_id=f"{session_id}_{agent_name}",
             actor_id="system",
+            async_mode=True,
         )
         return AgentCoreMemorySessionManager(
             agentcore_memory_config=memory_config,
