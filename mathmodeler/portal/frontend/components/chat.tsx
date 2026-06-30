@@ -216,35 +216,14 @@ export function Chat({
     return () => document.removeEventListener('mm-quick-reply', handler);
   }, [sendMessage, busy]);
 
-  // Early save: persist as soon as the first user message is sent so the
-  // session appears in the sidebar immediately (even while still streaming).
+  // Save session metadata (title) on first message so it appears in sidebar.
   useEffect(() => {
     if (didEarlySaveRef.current || messages.length === 0) return;
-    // Only trigger once per session (when transitioning from empty -> has messages).
     didEarlySaveRef.current = true;
     saveSession(id, messages as any[]);
     onPersisted?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages]);
-
-  // Periodic save during streaming: every 15s while busy, persist the latest
-  // snapshot so DDB stays roughly in sync even if user closes the tab.
-  useEffect(() => {
-    if (!busy || messages.length === 0) return;
-    const timer = setInterval(() => {
-      saveSession(id, messages as any[]);
-    }, 15_000);
-    return () => clearInterval(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [busy, messages, id]);
-
-  // Persist to DDB when the conversation finishes streaming (idle).
-  useEffect(() => {
-    if (busy || messages.length === 0) return;
-    saveSession(id, messages as any[]);
-    onPersisted?.();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [messages, busy, id]);
 
   const submit = () => {
     const text = input.trim();

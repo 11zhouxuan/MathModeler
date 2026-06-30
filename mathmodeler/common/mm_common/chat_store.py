@@ -111,6 +111,30 @@ def save_session(
         logger.warning(f"[chat_store] save_session failed for {session_id}: {e}")
 
 
+def save_session_meta(session_id: str, problem: str = "", title: str | None = None) -> None:
+    """Save only session metadata (title for sidebar). No message items."""
+    if not session_id:
+        return
+    now = int(time.time())
+    derived_title = title or (problem[:24] if problem else "新会话")
+    try:
+        _ddb().update_item(
+            Key={"PK": "SESSION", "SK": session_id},
+            UpdateExpression="SET updated_at = :ts"
+                            ", #t = if_not_exists(#t, :title)"
+                            ", problem = if_not_exists(problem, :prob)"
+                            ", created_at = if_not_exists(created_at, :ts)",
+            ExpressionAttributeNames={"#t": "title"},
+            ExpressionAttributeValues={
+                ":ts": now,
+                ":title": derived_title,
+                ":prob": (problem or "")[:500],
+            },
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[chat_store] save_session_meta failed for {session_id}: {e}")
+
+
 def list_sessions(limit: int = 50) -> list[dict[str, Any]]:
     """List all sessions ordered by updated_at descending (most recent first)."""
     try:

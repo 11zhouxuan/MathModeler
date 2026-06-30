@@ -86,15 +86,15 @@ export function deriveTitle(messages: any[]): string {
   return text.length > 24 ? text.slice(0, 24) + '…' : text;
 }
 
-/** Persist (upsert) a session's messages to the backend. */
+/** Save session metadata (title only) to the backend. */
 export async function saveSessionAsync(id: string, messages: any[]): Promise<void> {
   if (!id || !messages || messages.length === 0) return;
   const problem = deriveTitle(messages);
   try {
-    await fetch(`${API_BASE}/api/sessions/${id}/messages`, {
+    await fetch(`${API_BASE}/api/sessions/${id}/meta`, {
       method: 'POST',
       headers: _headers(),
-      body: JSON.stringify({ messages, problem }),
+      body: JSON.stringify({ problem }),
     });
   } catch {
     // Best-effort; silent failure.

@@ -323,7 +323,10 @@ def _iter_chat_stream(body: dict):
     finally:
         yield "data: [DONE]\n\n"
         # Server-side DDB save: persist the full conversation after stream ends.
-        _save_chat_history_server_side(sid, messages, accumulated_frames, problem)
+        # Save session metadata only (title for sidebar). Full history is
+        # reconstructed from AgentCore Memory on demand.
+        from mm_common import chat_store
+        chat_store.save_session_meta(sid, problem)
 
 
 def _save_chat_history_server_side(
@@ -514,21 +517,20 @@ async def list_sessions(_: None = Depends(_require_auth)) -> JSONResponse:
 
 @app.get("/api/sessions/{session_id}/messages")
 async def get_session_messages(session_id: str, _: None = Depends(_require_auth)) -> JSONResponse:
-    """Return the saved UI messages for a session from DynamoDB."""
-    from mm_common import chat_store
-    messages = chat_store.load_messages(session_id)
+    """Return session history reconstructed from AgentCore Memory."""
+    from mm_common import history
+    messages = history.load_session_history(session_id)
     return JSONResponse({"messages": messages})
 
 
-@app.post("/api/sessions/{session_id}/messages")
-async def save_session_messages(session_id: str, request: Request, _: None = Depends(_require_auth)) -> JSONResponse:
-    """Save UI messages to DynamoDB (called by frontend when stream completes)."""
+@app.post("/api/sessions/{session_id}/meta")
+async def save_session_meta(session_id: str, request: Request, _: None = Depends(_require_auth)) -> JSONResponse:
+    """Save session metadata (title) to DynamoDB. No full message persistence."""
     from mm_common import chat_store
     body = await request.json()
-    messages = body.get("messages", [])
     problem = body.get("problem", "")
     try:
-        chat_store.save_session(session_id, messages, problem=problem)
+        chat_store.save_session_meta(session_id, problem=problem)
         return JSONResponse({"ok": True})
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
@@ -584,7 +586,7 @@ async def list_session_files(session_id: str, _: None = Depends(_require_auth)) 
                 for obj in page.get("Contents", []):
                     key = obj["Key"]
                     rel = key[len(prefix):]
-                    if rel:
+                    if rel and not rel.endswith("/"):
                         files.append((obj.get("Size", 0), rel))
             tree = _build_tree_from_files(files)
             return JSONResponse({"session_id": session_id, "tree": tree})
