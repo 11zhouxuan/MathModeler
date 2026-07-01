@@ -235,7 +235,18 @@ async def _run_supervisor_bg(session_task: background.SessionTask, body: dict):
         session_task.append(f"data: {{\"type\":\"error\",\"errorText\":\"{e!s}\"}}\n\n")
     finally:
         set_busy(False)
-        logger.info("[orchestrator] background task ENDED session=%s", session_id)
+        # Debug: log what tools are in supervisor.messages
+        try:
+            sup_tools = set()
+            for m in getattr(sup.supervisor, 'messages', []) or []:
+                for blk in m.get('content', []):
+                    tu = blk.get('toolUse')
+                    if tu:
+                        sup_tools.add(tu.get('name', '?'))
+            logger.info("[orchestrator] background task ENDED session=%s supervisor_tools=%s msgs=%d",
+                        session_id, sorted(sup_tools), len(getattr(sup.supervisor, 'messages', []) or []))
+        except Exception:
+            logger.info("[orchestrator] background task ENDED session=%s", session_id)
         _RUNNING.pop(session_id, None)
         _teardown_subagents(sup)
 
