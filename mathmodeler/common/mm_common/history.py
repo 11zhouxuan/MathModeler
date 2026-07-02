@@ -34,7 +34,8 @@ def load_session_history(session_id: str) -> list[dict]:
         return []
     pending = _load_pending_interrupts(session_id)
     subagent_histories = _load_subagent_histories(session_id, raw_messages)
-    return _map_to_ai_sdk(raw_messages, session_id, pending, subagent_histories)
+    mapped = _map_to_ai_sdk(raw_messages, session_id, pending, subagent_histories)
+    return _merge_consecutive_assistant(mapped)
 
 
 def _load_subagent_histories(session_id: str, supervisor_messages: list[dict]) -> dict[str, list[dict]]:
@@ -408,6 +409,24 @@ def _extract_result_text(tr: dict) -> str:
         if isinstance(blk, dict) and blk.get("text"):
             texts.append(blk["text"])
     return "\n".join(texts)
+
+
+def _merge_consecutive_assistant(messages: list[dict]) -> list[dict]:
+    """Merge consecutive assistant messages into one.
+
+    AI SDK useChat expects alternating user/assistant messages. Multiple
+    consecutive assistant messages cause rendering issues. Merge their
+    parts into a single assistant message.
+    """
+    if not messages:
+        return []
+    result: list[dict] = []
+    for m in messages:
+        if m["role"] == "assistant" and result and result[-1]["role"] == "assistant":
+            result[-1]["parts"].extend(m["parts"])
+        else:
+            result.append(dict(m))
+    return result
 
 
 def _gen_id() -> str:
