@@ -194,6 +194,7 @@ def _map_to_ai_sdk(messages: list[dict], session_id: str,
                 j += 1
             # Also grab the toolResult messages (role=user with only toolResults)
             tool_results: dict[str, Any] = {}
+            ask_user_answer: str | None = None
             while j < len(messages):
                 next_msg = messages[j]
                 if next_msg.get("role") != "user":
@@ -210,12 +211,27 @@ def _map_to_ai_sdk(messages: list[dict], session_id: str,
                 else:
                     break
 
+            # Detect ask_user answer: if assistant had ask_user toolUse, extract user's reply
+            for blk in assistant_blocks:
+                tu = blk.get("toolUse")
+                if tu and tu.get("name") == "ask_user":
+                    tr = tool_results.get(tu["toolUseId"])
+                    if tr:
+                        ask_user_answer = _extract_result_text(tr)
+
             parts = _map_assistant_turn(assistant_blocks, tool_results, _pending, _subagent_histories)
             if parts:
                 result.append({
                     "id": _gen_id(),
                     "role": "assistant",
                     "parts": parts,
+                })
+            # Insert a user message for ask_user answer (breaks consecutive assistant chain)
+            if ask_user_answer:
+                result.append({
+                    "id": _gen_id(),
+                    "role": "user",
+                    "parts": [{"type": "text", "text": ask_user_answer}],
                 })
             i = j
             continue
